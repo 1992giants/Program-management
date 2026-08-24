@@ -13,6 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL('https://onmaeum-program-care.mind-park.chatgpt.site'),
   title: '온마음 | 프로그램 참여관리',
   description: '정신건강 프로그램 신청, 출석, 참여이력과 확인서를 한곳에서 관리합니다.',
   openGraph: {
