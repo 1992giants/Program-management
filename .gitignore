@@ -36,3 +36,9 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# local participant database and backups
+/data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
