@@ -1,15 +1,22 @@
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 
 let database: DatabaseSync | null = null;
 
 export function getDatabasePath() {
-  const configuredPath = process.env.ONMAEUM_DB_PATH;
+  const environment=process.env.NODE_ENV;
+  const configuredPath=(environment==='production'?process.env.ONMAEUM_DB_PATH:environment==='test'?process.env.ONMAEUM_TEST_DB_PATH:process.env.ONMAEUM_DEV_DB_PATH)?.trim();
+  if (environment === 'production' && !configuredPath) {
+    throw new Error('운영 환경에서는 ONMAEUM_DB_PATH에 서버 PC의 로컬 DB 절대경로를 명시해야 합니다.');
+  }
+  if (configuredPath && !path.isAbsolute(configuredPath)) {
+    throw new Error('현재 환경의 DB 경로는 절대경로여야 합니다.');
+  }
   return configuredPath
     ? path.resolve(/* turbopackIgnore: true */ configuredPath)
-    : path.join(/* turbopackIgnore: true */ process.cwd(), 'data', 'onmaeum.sqlite');
+    : path.join(/* turbopackIgnore: true */ process.cwd(), 'data',environment==='test'?'test.sqlite':'development.sqlite');
 }
 
 export function getBackupDirectory() {
@@ -33,15 +40,21 @@ export function getDatabase() {
   }
   mkdirSync(path.dirname(filePath), { recursive: true });
   mkdirSync(getBackupDirectory(), { recursive: true });
-  database = new DatabaseSync(filePath);
-  database.exec('PRAGMA foreign_keys = ON');
-  // DELETE journal mode is slower than WAL but works more reliably on removable
-  // drives and SMB-style internal shares when one server process owns the file.
-  database.exec('PRAGMA journal_mode = DELETE');
-  database.exec('PRAGMA synchronous = FULL');
-  database.exec('PRAGMA busy_timeout = 5000');
-  ensureDatabase(database);
-  return database;
+  const candidate = new DatabaseSync(filePath);
+  try {
+    candidate.exec('PRAGMA foreign_keys = ON');
+    // DELETE journal mode is slower than WAL but works more reliably on removable
+    // drives and SMB-style internal shares when one server process owns the file.
+    candidate.exec('PRAGMA journal_mode = DELETE');
+    candidate.exec('PRAGMA synchronous = FULL');
+    candidate.exec('PRAGMA busy_timeout = 5000');
+    ensureDatabase(candidate);
+    database=candidate;
+    return database;
+  } catch(error) {
+    candidate.close();
+    throw error;
+  }
 }
 
 function ensureDatabase(db: DatabaseSync) {
@@ -208,15 +221,38 @@ function ensureDatabase(db: DatabaseSync) {
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('manager_name', '프로그램 담당자');
   }
   const seedDate=new Date().toISOString().slice(0,10);
-  const userCount=db.prepare('SELECT COUNT(*) AS count FROM staff_users').get() as {count:number};
-  if(!userCount.count) db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at) VALUES (?,?,?,?,?,?,?)').run('USR-ADMIN','admin','센터 관리자',hashPin('admin','1234'),'관리자',1,seedDate);
+  bootstrapInitialAdministrator(db,seedDate);
   const insertAssessment=db.prepare('INSERT OR IGNORE INTO assessment_catalog (id,name,min_score,max_score,active,created_at) VALUES (?,?,?,?,1,?)');
   insertAssessment.run('ASM-PHQ9','PHQ-9',0,27,seedDate);
   insertAssessment.run('ASM-GAD7','GAD-7',0,21,seedDate);
   insertAssessment.run('ASM-PSS10','PSS-10',0,40,seedDate);
   const count = db.prepare('SELECT COUNT(*) AS count FROM participants').get() as { count:number };
-  if (!count.count) seedDatabase(db);
+  if (process.env.NODE_ENV !== 'production' && process.env.ONMAEUM_ENABLE_DEMO_SEED === '1' && !count.count) seedDatabase(db);
   db.exec('PRAGMA optimize');
+}
+
+function bootstrapInitialAdministrator(db:DatabaseSync,createdAt:string) {
+  const userCount=db.prepare('SELECT COUNT(*) AS count FROM staff_users').get() as {count:number};
+  const legacyAutomaticAccount=db.prepare('SELECT id FROM staff_users WHERE id=?').get('USR-ADMIN') as {id:string}|undefined;
+  if(userCount.count&&!legacyAutomaticAccount)return;
+  const username=process.env.ONMAEUM_BOOTSTRAP_ADMIN_USERNAME?.trim().toLowerCase();
+  const displayName=process.env.ONMAEUM_BOOTSTRAP_ADMIN_DISPLAY_NAME?.trim();
+  const pin=process.env.ONMAEUM_BOOTSTRAP_ADMIN_PIN?.trim();
+  if(!username||!displayName||!pin){
+    throw new Error('최초 관리자 계정이 없습니다. ONMAEUM_BOOTSTRAP_ADMIN_USERNAME, ONMAEUM_BOOTSTRAP_ADMIN_DISPLAY_NAME, ONMAEUM_BOOTSTRAP_ADMIN_PIN을 모두 설정해 한 번만 초기화하세요.');
+  }
+  if(pin.length<8||/^([0-9])\1+$/.test(pin)){
+    throw new Error('최초 관리자 PIN은 반복 숫자가 아닌 8자리 이상이어야 합니다.');
+  }
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if(legacyAutomaticAccount)db.prepare('DELETE FROM staff_users WHERE id=?').run(legacyAutomaticAccount.id);
+    db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,pin_changed_at,must_change_pin) VALUES (?,?,?,?,?,1,?,NULL,1)').run(`USR-${randomUUID()}`,username,displayName,hashPin(username,pin),'관리자',createdAt);
+    db.exec('COMMIT');
+  } catch(error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 function ensureColumn(db:DatabaseSync,table:string,column:string,definition:string) {
