@@ -1,12 +1,19 @@
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 
 let database: DatabaseSync | null = null;
+const APPLICATION_ID='onmaeum-program-care';
+
+type DatabaseEnvironment='production'|'development'|'test';
+
+function databaseEnvironment():DatabaseEnvironment {
+  return process.env.NODE_ENV==='production'?'production':process.env.NODE_ENV==='test'?'test':'development';
+}
 
 export function getDatabasePath() {
-  const environment=process.env.NODE_ENV;
+  const environment=databaseEnvironment();
   const configuredPath=(environment==='production'?process.env.ONMAEUM_DB_PATH:environment==='test'?process.env.ONMAEUM_TEST_DB_PATH:process.env.ONMAEUM_DEV_DB_PATH)?.trim();
   if (environment === 'production' && !configuredPath) {
     throw new Error('운영 환경에서는 ONMAEUM_DB_PATH에 서버 PC의 로컬 DB 절대경로를 명시해야 합니다.');
@@ -34,30 +41,72 @@ export function getStorageInfo() {
 
 export function getDatabase() {
   if (database) return database;
-  const filePath = getDatabasePath();
-  if (/^(\\\\|\/\/)/.test(filePath) && process.env.ONMAEUM_ALLOW_NETWORK_DB !== '1') {
+  const environment=databaseEnvironment(),filePath=getDatabasePath(),networkPath=/^(\\\\|\/\/)/.test(filePath);
+  const initializeProduction=process.env.ONMAEUM_INITIALIZE_PRODUCTION_DB==='1';
+  if(environment==='production'&&networkPath)throw new Error('운영 SQLite DB는 네트워크 공유 경로에 둘 수 없습니다. ONMAEUM_ALLOW_NETWORK_DB는 production에서 적용되지 않습니다.');
+  const fileExisted=existsSync(filePath);
+  if(environment==='production'&&!fileExisted&&!initializeProduction)throw new Error('운영 DB 파일이 존재하지 않습니다. 경로를 확인하세요. 신규 DB는 명시적인 production 초기화 모드에서만 생성할 수 있습니다.');
+  if(environment==='production'&&fileExisted&&initializeProduction)throw new Error('production 초기화 모드는 새 DB 파일에만 사용할 수 있습니다. 기존 DB로 실행할 때는 초기화 모드를 해제하세요.');
+  if (networkPath && process.env.ONMAEUM_ALLOW_NETWORK_DB !== '1') {
     throw new Error('실시간 SQLite 파일은 네트워크 공유 경로에 둘 수 없습니다. 서버 PC의 로컬 경로를 사용하고 외장·네트워크 드라이브는 백업 경로로 지정하세요.');
   }
   mkdirSync(path.dirname(filePath), { recursive: true });
   mkdirSync(getBackupDirectory(), { recursive: true });
   const candidate = new DatabaseSync(filePath);
   try {
+    const adopted=validateExistingDatabase(candidate,environment,fileExisted,process.env.ONMAEUM_ADOPT_PRODUCTION_DB==='1');
     candidate.exec('PRAGMA foreign_keys = ON');
     // DELETE journal mode is slower than WAL but works more reliably on removable
     // drives and SMB-style internal shares when one server process owns the file.
     candidate.exec('PRAGMA journal_mode = DELETE');
     candidate.exec('PRAGMA synchronous = FULL');
     candidate.exec('PRAGMA busy_timeout = 5000');
-    ensureDatabase(candidate);
+    ensureDatabase(candidate,{
+      allowInitialAdministrator:environment!=='production'||initializeProduction,
+      migrateUsrAdmin:process.env.ONMAEUM_MIGRATE_USR_ADMIN==='1',
+    });
+    if(!fileExisted||adopted)writeDatabaseMarkers(candidate,environment);
     database=candidate;
     return database;
   } catch(error) {
     candidate.close();
+    if(!fileExisted&&initializeProduction){rmSync(filePath,{force:true});rmSync(`${filePath}-journal`,{force:true});}
     throw error;
   }
 }
 
-function ensureDatabase(db: DatabaseSync) {
+function validateExistingDatabase(db:DatabaseSync,environment:DatabaseEnvironment,fileExisted:boolean,allowProductionAdoption:boolean) {
+  if(!fileExisted)return false;
+  const tables=new Set((db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as {name:string}[]).map(row=>row.name));
+  if(!tables.has('settings')){
+    if(environment==='production')throw new Error('지정한 파일은 Onmaeum 운영 DB로 확인되지 않습니다. 기존 DB를 자동 변경하지 않습니다.');
+    return false;
+  }
+  const marker=(key:string)=>(db.prepare('SELECT value FROM settings WHERE key=?').get(key) as {value:string}|undefined)?.value;
+  const applicationId=marker('application_id'),storedEnvironment=marker('database_environment');
+  const required=['settings','participants','programs','program_runs','sessions','applications','attendance','staff_users','auth_sessions'];
+  if(applicationId&&applicationId!==APPLICATION_ID)throw new Error('다른 애플리케이션의 SQLite 파일은 열 수 없습니다.');
+  if(storedEnvironment&&storedEnvironment!==environment)throw new Error(`${storedEnvironment} DB를 ${environment} 환경에서 열 수 없습니다.`);
+  if(applicationId===APPLICATION_ID&&storedEnvironment===environment){
+    const missing=required.filter(table=>!tables.has(table));
+    if(missing.length)throw new Error(`Onmaeum DB 필수 테이블이 누락되었습니다: ${missing.join(', ')}`);
+    return false;
+  }
+  if(environment!=='production')return false;
+  if(!allowProductionAdoption)throw new Error('기존 marker 없는 DB입니다. 경로와 백업을 확인한 뒤 명시적인 production DB adoption 절차를 수행하세요.');
+  const missing=required.filter(table=>!tables.has(table));
+  if(missing.length)throw new Error(`기존 DB를 adoption할 수 없습니다. 필수 테이블이 누락되었습니다: ${missing.join(', ')}`);
+  return true;
+}
+
+function writeDatabaseMarkers(db:DatabaseSync,environment:DatabaseEnvironment) {
+  const set=db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
+  set.run('application_id',APPLICATION_ID);
+  set.run('database_environment',environment);
+  set.run('database_initialized_at',new Date().toISOString());
+}
+
+function ensureDatabase(db: DatabaseSync,options:{allowInitialAdministrator:boolean;migrateUsrAdmin:boolean}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -221,7 +270,7 @@ function ensureDatabase(db: DatabaseSync) {
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('manager_name', '프로그램 담당자');
   }
   const seedDate=new Date().toISOString().slice(0,10);
-  bootstrapInitialAdministrator(db,seedDate);
+  bootstrapInitialAdministrator(db,seedDate,options);
   const insertAssessment=db.prepare('INSERT OR IGNORE INTO assessment_catalog (id,name,min_score,max_score,active,created_at) VALUES (?,?,?,?,1,?)');
   insertAssessment.run('ASM-PHQ9','PHQ-9',0,27,seedDate);
   insertAssessment.run('ASM-GAD7','GAD-7',0,21,seedDate);
@@ -231,28 +280,35 @@ function ensureDatabase(db: DatabaseSync) {
   db.exec('PRAGMA optimize');
 }
 
-function bootstrapInitialAdministrator(db:DatabaseSync,createdAt:string) {
-  const userCount=db.prepare('SELECT COUNT(*) AS count FROM staff_users').get() as {count:number};
-  const legacyAutomaticAccount=db.prepare('SELECT id FROM staff_users WHERE id=?').get('USR-ADMIN') as {id:string}|undefined;
-  if(userCount.count&&!legacyAutomaticAccount)return;
+function bootstrapCredentials() {
   const username=process.env.ONMAEUM_BOOTSTRAP_ADMIN_USERNAME?.trim().toLowerCase();
   const displayName=process.env.ONMAEUM_BOOTSTRAP_ADMIN_DISPLAY_NAME?.trim();
   const pin=process.env.ONMAEUM_BOOTSTRAP_ADMIN_PIN?.trim();
-  if(!username||!displayName||!pin){
-    throw new Error('최초 관리자 계정이 없습니다. ONMAEUM_BOOTSTRAP_ADMIN_USERNAME, ONMAEUM_BOOTSTRAP_ADMIN_DISPLAY_NAME, ONMAEUM_BOOTSTRAP_ADMIN_PIN을 모두 설정해 한 번만 초기화하세요.');
+  if(!username||!displayName||!pin)throw new Error('ONMAEUM_BOOTSTRAP_ADMIN_USERNAME, ONMAEUM_BOOTSTRAP_ADMIN_DISPLAY_NAME, ONMAEUM_BOOTSTRAP_ADMIN_PIN을 모두 설정해야 합니다.');
+  if(pin.length<8||/^([0-9])\1+$/.test(pin))throw new Error('관리자 PIN은 반복 숫자가 아닌 8자리 이상이어야 합니다.');
+  return {username,displayName,pin};
+}
+
+function bootstrapInitialAdministrator(db:DatabaseSync,createdAt:string,options:{allowInitialAdministrator:boolean;migrateUsrAdmin:boolean}) {
+  const userCount=db.prepare('SELECT COUNT(*) AS count FROM staff_users').get() as {count:number};
+  const legacyAutomaticAccount=db.prepare('SELECT id FROM staff_users WHERE id=?').get('USR-ADMIN') as {id:string}|undefined;
+  const legacyReviewed=(db.prepare('SELECT value FROM settings WHERE key=?').get('usr_admin_migration_completed') as {value:string}|undefined)?.value==='1';
+  if(legacyAutomaticAccount&&!legacyReviewed){
+    if(!options.migrateUsrAdmin)throw new Error('기존 USR-ADMIN 계정이 발견되었습니다. 자동 교체하지 않았습니다. 백업 후 명시적인 USR-ADMIN migration 절차를 수행하세요.');
+    const {username,displayName,pin}=bootstrapCredentials();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare('DELETE FROM auth_sessions WHERE user_id=?').run(legacyAutomaticAccount.id);
+      db.prepare(`UPDATE staff_users SET username=?,display_name=?,pin_hash=?,role='관리자',active=1,pin_changed_at=NULL,must_change_pin=1,failed_attempts=0,locked_until=NULL WHERE id=?`).run(username,displayName,hashPin(username,pin),legacyAutomaticAccount.id);
+      db.prepare(`INSERT INTO settings (key,value) VALUES ('usr_admin_migration_completed','1') ON CONFLICT(key) DO UPDATE SET value='1'`).run();
+      db.exec('COMMIT');
+    } catch(error) {db.exec('ROLLBACK');throw error;}
+    return;
   }
-  if(pin.length<8||/^([0-9])\1+$/.test(pin)){
-    throw new Error('최초 관리자 PIN은 반복 숫자가 아닌 8자리 이상이어야 합니다.');
-  }
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    if(legacyAutomaticAccount)db.prepare('DELETE FROM staff_users WHERE id=?').run(legacyAutomaticAccount.id);
-    db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,pin_changed_at,must_change_pin) VALUES (?,?,?,?,?,1,?,NULL,1)').run(`USR-${randomUUID()}`,username,displayName,hashPin(username,pin),'관리자',createdAt);
-    db.exec('COMMIT');
-  } catch(error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
+  if(userCount.count)return;
+  if(!options.allowInitialAdministrator)throw new Error('운영 DB에 관리자 계정이 없습니다. 일반 서버 실행에서는 관리자를 자동 생성하지 않습니다.');
+  const {username,displayName,pin}=bootstrapCredentials();
+  db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,pin_changed_at,must_change_pin) VALUES (?,?,?,?,?,1,?,NULL,1)').run(`USR-${randomUUID()}`,username,displayName,hashPin(username,pin),'관리자',createdAt);
 }
 
 function ensureColumn(db:DatabaseSync,table:string,column:string,definition:string) {

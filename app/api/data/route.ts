@@ -1,8 +1,8 @@
 import { backup, DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { createRun, getBackupDirectory, getDatabase, getDatabasePath, getStorageInfo, hashPin, verifyPin } from '@/db';
-import { attendanceOnlySnapshot, canPerformAction, createAuthSession, getAuthenticatedUser, invalidateAuthSession, type SafeUser } from '@/lib/security';
+import { createRun, getBackupDirectory, getDatabase, getDatabasePath, getStorageInfo, hashPin, verifyPin } from '../../../db/index.ts';
+import { attendanceOnlySnapshot, canPerformAction, createAuthSession, getAuthenticatedUser, invalidateAuthSession, type SafeUser } from '../../../lib/security.ts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -170,10 +170,16 @@ export async function POST(request:Request) {
       const sessionId=text(body.sessionId),applicationId=Number(body.applicationId),status=text(body.status),noteText=text(body.note).trim(),validStatuses=['참석','결석','보강','취소','노쇼','기타','미입력'];if(!validStatuses.includes(status))throw new Error('올바른 출석 상태를 선택하세요.');if(['결석','취소','노쇼','기타'].includes(status)&&!noteText)throw new Error(`${status} 사유나 연락 결과를 입력하세요.`);const sessionState=db.prepare('SELECT run_id,attendance_status FROM sessions WHERE id=?').get(sessionId) as {run_id:string;attendance_status:string}|undefined;if(!sessionState)throw new Error('회기를 찾을 수 없습니다.');if(sessionState.attendance_status==='마감')throw new Error('마감된 회기의 출석은 수정할 수 없습니다. 관리자가 회기를 다시 열어야 합니다.');const application=db.prepare('SELECT run_id FROM applications WHERE id=?').get(applicationId) as {run_id:string|null}|undefined;if(!application||application.run_id!==sessionState.run_id)throw new Error('해당 차수에 배정된 참가자만 출석을 입력할 수 있습니다.');const makeupFor=text(body.makeupForSessionId);if(makeupFor&&!db.prepare('SELECT id FROM sessions WHERE id=?').get(makeupFor))throw new Error('보강 대상 회기를 찾을 수 없습니다.');
       const before=db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId);db.prepare(`INSERT INTO attendance (application_id,session_id,status,note,contacted_at,makeup_for_session_id) VALUES (?,?,?,?,?,?) ON CONFLICT(application_id,session_id) DO UPDATE SET status=excluded.status,note=excluded.note,contacted_at=excluded.contacted_at,makeup_for_session_id=excluded.makeup_for_session_id`).run(applicationId,sessionId,status,noteText,text(body.contactedAt)||null,makeupFor||null);const after=db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId);logChange(db,'출석 입력','출석',`${applicationId}:${sessionId}`,before,after,`출석 상태를 ${status}(으)로 변경`,user.display_name,noteText,requestIp(request));
     } else if (body.action === 'attendanceBulk') {
-      const applicationIds=Array.isArray(body.applicationIds)?body.applicationIds.map(Number).filter(Number.isFinite):[];
+      const applicationIds=[...new Set(Array.isArray(body.applicationIds)?body.applicationIds.map(Number).filter(Number.isFinite):[])];
       const sessionId=text(body.sessionId),status=text(body.status);
       if(!['참석','결석','보강','취소','노쇼','기타','미입력'].includes(status))throw new Error('올바른 출석 상태를 선택하세요.');
-      const sessionState=db.prepare('SELECT attendance_status FROM sessions WHERE id=?').get(sessionId) as {attendance_status:string}|undefined;if(sessionState?.attendance_status==='마감')throw new Error('마감된 회기의 출석은 수정할 수 없습니다.');
+      if(!applicationIds.length)throw new Error('출석을 입력할 참가자를 선택하세요.');
+      const sessionState=db.prepare('SELECT run_id,attendance_status FROM sessions WHERE id=?').get(sessionId) as {run_id:string;attendance_status:string}|undefined;
+      if(!sessionState)throw new Error('회기를 찾을 수 없습니다.');
+      if(sessionState.attendance_status==='마감')throw new Error('마감된 회기의 출석은 수정할 수 없습니다.');
+      const selectedApplications=db.prepare(`SELECT id,run_id FROM applications WHERE id IN (${applicationIds.map(()=>'?').join(',')})`).all(...applicationIds) as {id:number;run_id:string|null}[];
+      if(selectedApplications.length!==applicationIds.length)throw new Error('존재하지 않는 신청 기록이 포함되어 있습니다.');
+      if(selectedApplications.some(application=>application.run_id!==sessionState.run_id))throw new Error('해당 차수에 배정된 참가자만 일괄 출석을 입력할 수 있습니다.');
       db.exec('BEGIN IMMEDIATE');
       try { for(const applicationId of applicationIds){const before=db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId);db.prepare(`INSERT INTO attendance (application_id,session_id,status,note) VALUES (?,?,?,'') ON CONFLICT(application_id,session_id) DO UPDATE SET status=excluded.status`).run(applicationId,sessionId,status);logChange(db,'출석 일괄 입력','출석',`${applicationId}:${sessionId}`,before,db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId),`일괄 출석 상태를 ${status}(으)로 변경`,user.display_name,'',requestIp(request));}db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
     } else if (body.action === 'closeAttendanceSession') {
