@@ -462,3 +462,52 @@ interpret it as:
 * validate the result
 
 The goal is to make the application feel more deliberate, consistent, and finished without changing what the product fundamentally is.
+
+---
+
+## UX Principles
+
+When improving UX, prioritize reducing user friction rather than adding visual decoration.
+
+Evaluate complete user flows, not isolated screens.
+
+Always consider:
+
+- What is the user's goal on this screen?
+- Is the primary next action obvious?
+- Can unnecessary steps be removed?
+- Can repeated input be avoided?
+- Does every important action provide immediate feedback?
+- Is the current system state visible?
+- Are loading, success, error, and empty states handled?
+- Can user mistakes be prevented?
+- Can mistakes be easily recovered from?
+- Are destructive actions appropriately protected?
+- Are similar actions consistent across the product?
+- Does the UI preserve the user's context after an action?
+
+Prefer:
+
+- fewer steps
+- sensible defaults
+- clear primary actions
+- immediate feedback
+- inline validation
+- reversible actions
+- preserved user input
+- predictable navigation
+- clear system status
+
+Avoid:
+
+- unnecessary confirmation dialogs
+- unnecessary navigation
+- hidden important actions
+- ambiguous button labels
+- silent background actions
+- resetting user input unexpectedly
+- making users repeat information already known by the system
+
+Do not change established product workflows solely based on subjective preference.
+
+When a UX change affects user flow or behavior, report the proposed change before implementing it unless the improvement is clearly low-risk.
