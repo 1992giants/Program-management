@@ -1,8 +1,8 @@
 import { backup, DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
-import { createRun, getBackupDirectory, getDatabase, getDatabasePath, getStorageInfo, hashPin, verifyPin } from '@/db';
+import { createRun, getBackupDirectory, getDatabase, getDatabasePath, getStorageInfo, hashPin, verifyPin } from '../../../db/index.ts';
+import { attendanceOnlySnapshot, canPerformAction, createAuthSession, getAuthenticatedUser, invalidateAuthSession, type SafeUser } from '../../../lib/security.ts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -10,18 +10,7 @@ export const dynamic = 'force-dynamic';
 function rows(sql:string, ...params:SQLInputValue[]) { return getDatabase().prepare(sql).all(...params); }
 const text = (value:unknown) => String(value ?? '');
 function nextQueueNumber(db:DatabaseSync,programId:string){return ((db.prepare('SELECT COALESCE(MAX(queue_number),0)+1 AS next FROM applications WHERE program_id=?').get(programId) as {next:number}).next)||1}
-type SafeUser={id:string;username:string;display_name:string;role:string;active:number;must_change_pin?:number;last_login_at?:string|null};
-
 function requestIp(request:Request){return request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()||request.headers.get('x-real-ip')||'local'}
-
-function authenticatedUser(request:Request,db:DatabaseSync) {
-  const token=request.headers.get('authorization')?.replace(/^Bearer\s+/i,'')||'';
-  if(!token)return undefined;
-  const user=db.prepare(`SELECT u.id,u.username,u.display_name,u.role,u.active,u.must_change_pin,u.last_login_at FROM auth_sessions s JOIN staff_users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>? AND u.active=1`).get(token,new Date().toISOString()) as SafeUser|undefined;
-  if(user)db.prepare('UPDATE auth_sessions SET last_seen_at=? WHERE token=?').run(new Date().toISOString(),token);
-  return user;
-}
-function can(user:SafeUser,action:string){if(user.role==='관리자')return true;if(user.role==='출석 입력 전용')return ['attendance','attendanceBulk','closeAttendanceSession','recordAccess','changeMyPin'].includes(action);return !['createUser','updateUser','restoreBackup','settings','reopenAttendanceSession'].includes(action);}
 
 function actorName(db:DatabaseSync) { return (db.prepare(`SELECT value FROM settings WHERE key='manager_name'`).get() as {value:string}|undefined)?.value||'프로그램 담당자'; }
 function logChange(db:DatabaseSync, action:string, entityType:string, entityId:string|number, before:unknown, after:unknown, summary:string, requestedActor?:string, reason='',ipAddress='local') {
@@ -41,6 +30,7 @@ function validateBackup(filePath:string) {
 }
 
 function snapshot(currentUser?:SafeUser) {
+  if(currentUser?.role==='출석 입력 전용')return attendanceOnlySnapshot(getDatabase(),currentUser);
   const settings = Object.fromEntries((rows('SELECT key, value FROM settings') as {key:string;value:string}[]).map(item=>[item.key,item.value]));
   const participants=rows(`SELECT p.*, COUNT(DISTINCT a.id) AS application_count, COUNT(DISTINCT CASE WHEN at.status IN ('참석','보강') THEN at.id END) AS attended_count, MAX(s.session_date) AS last_visit FROM participants p LEFT JOIN applications a ON a.participant_id=p.id LEFT JOIN attendance at ON at.application_id=a.id LEFT JOIN sessions s ON s.id=at.session_id GROUP BY p.id ORDER BY p.created_at DESC`) as Record<string,unknown>[];
   const duplicateMap=new Map<string,Record<string,unknown>[]>();
@@ -79,7 +69,7 @@ function snapshot(currentUser?:SafeUser) {
 }
 
 export async function GET(request:Request) {
-  try { const db=getDatabase(),user=authenticatedUser(request,db);if(!user)return Response.json({error:'로그인이 필요합니다.',loginRequired:true},{status:401});return Response.json(snapshot(user)); }
+  try { const db=getDatabase(),user=getAuthenticatedUser(request,db);if(!user)return Response.json({error:'로그인이 필요합니다.',loginRequired:true},{status:401});return Response.json(snapshot(user)); }
   catch (error) { return Response.json({ error: error instanceof Error ? error.message : '로컬 데이터 파일을 열지 못했습니다.' }, { status:500 }); }
 }
 
@@ -97,14 +87,18 @@ export async function POST(request:Request) {
       }
       if(!user.pin_hash.startsWith('scrypt$')||user.pin_hash.split('$').length<3)db.prepare('UPDATE staff_users SET pin_hash=? WHERE id=?').run(hashPin(username,text(body.pin)),user.id);
       db.prepare('UPDATE staff_users SET failed_attempts=0,locked_until=NULL,last_login_at=? WHERE id=?').run(nowIso,user.id);
-      const token=randomUUID(),createdAt=nowIso,expiresAt=new Date(Date.now()+8*60*60*1000).toISOString();db.prepare('DELETE FROM auth_sessions WHERE expires_at<=?').run(createdAt);db.prepare('INSERT INTO auth_sessions (token,user_id,expires_at,created_at,last_seen_at,ip_address) VALUES (?,?,?,?,?,?)').run(token,user.id,expiresAt,createdAt,createdAt,ip);const safeUser:SafeUser={id:user.id,username:user.username,display_name:user.display_name,role:user.role,active:user.active,must_change_pin:user.must_change_pin,last_login_at:nowIso};logChange(db,'로그인','사용자',user.id,null,{role:user.role},`${user.display_name} 로그인`,user.display_name,'',ip);return Response.json({...snapshot(safeUser),authToken:token});
+      const {token}=createAuthSession(db,user.id,ip);const safeUser:SafeUser={id:user.id,username:user.username,display_name:user.display_name,role:user.role,active:user.active,must_change_pin:user.must_change_pin,last_login_at:nowIso};logChange(db,'로그인','사용자',user.id,null,{role:user.role},`${user.display_name} 로그인`,user.display_name,'',ip);return Response.json({...snapshot(safeUser),authToken:token});
     }
-    const user=authenticatedUser(request,db);
+    const user=getAuthenticatedUser(request,db);
     if(!user)return Response.json({error:'로그인이 만료되었습니다.',loginRequired:true},{status:401});
-    const action=text(body.action);if(user.must_change_pin&&!['changeMyPin','recordAccess'].includes(action))return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!can(user,action))return Response.json({error:`${user.role} 권한으로는 이 작업을 수행할 수 없습니다.`},{status:403});
+    const action=text(body.action);if(user.must_change_pin&&!['changeMyPin','recordAccess','logout'].includes(action))return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!canPerformAction(user,action))return Response.json({error:`${user.role} 권한으로는 이 작업을 수행할 수 없습니다.`},{status:403});
     body.actor=user.display_name;
     let responseWarning='';
-    if (body.action === 'createParticipant') {
+    if(body.action==='logout'){
+      invalidateAuthSession(request,db);
+      logChange(db,'로그아웃','사용자',user.id,null,null,`${user.display_name} 로그아웃`,user.display_name,'',requestIp(request));
+      return Response.json({ok:true});
+    } else if (body.action === 'createParticipant') {
       const duplicate=db.prepare(`SELECT id,name,phone FROM participants WHERE TRIM(name)=TRIM(?) AND REPLACE(REPLACE(phone,'-',''),' ','')=REPLACE(REPLACE(?,'-',''),' ','')`).get(text(body.name),text(body.phone)) as {id:string;name:string;phone:string}|undefined;
       if(duplicate) return Response.json({error:`동일한 이름과 연락처의 참가자(${duplicate.id})가 이미 있습니다. 기존 참가자를 확인하거나 중복 병합을 이용하세요.`,duplicate},{status:409});
       const id = `P-${today.slice(0,4)}-${String(Date.now()).slice(-6)}`;
@@ -176,10 +170,16 @@ export async function POST(request:Request) {
       const sessionId=text(body.sessionId),applicationId=Number(body.applicationId),status=text(body.status),noteText=text(body.note).trim(),validStatuses=['참석','결석','보강','취소','노쇼','기타','미입력'];if(!validStatuses.includes(status))throw new Error('올바른 출석 상태를 선택하세요.');if(['결석','취소','노쇼','기타'].includes(status)&&!noteText)throw new Error(`${status} 사유나 연락 결과를 입력하세요.`);const sessionState=db.prepare('SELECT run_id,attendance_status FROM sessions WHERE id=?').get(sessionId) as {run_id:string;attendance_status:string}|undefined;if(!sessionState)throw new Error('회기를 찾을 수 없습니다.');if(sessionState.attendance_status==='마감')throw new Error('마감된 회기의 출석은 수정할 수 없습니다. 관리자가 회기를 다시 열어야 합니다.');const application=db.prepare('SELECT run_id FROM applications WHERE id=?').get(applicationId) as {run_id:string|null}|undefined;if(!application||application.run_id!==sessionState.run_id)throw new Error('해당 차수에 배정된 참가자만 출석을 입력할 수 있습니다.');const makeupFor=text(body.makeupForSessionId);if(makeupFor&&!db.prepare('SELECT id FROM sessions WHERE id=?').get(makeupFor))throw new Error('보강 대상 회기를 찾을 수 없습니다.');
       const before=db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId);db.prepare(`INSERT INTO attendance (application_id,session_id,status,note,contacted_at,makeup_for_session_id) VALUES (?,?,?,?,?,?) ON CONFLICT(application_id,session_id) DO UPDATE SET status=excluded.status,note=excluded.note,contacted_at=excluded.contacted_at,makeup_for_session_id=excluded.makeup_for_session_id`).run(applicationId,sessionId,status,noteText,text(body.contactedAt)||null,makeupFor||null);const after=db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId);logChange(db,'출석 입력','출석',`${applicationId}:${sessionId}`,before,after,`출석 상태를 ${status}(으)로 변경`,user.display_name,noteText,requestIp(request));
     } else if (body.action === 'attendanceBulk') {
-      const applicationIds=Array.isArray(body.applicationIds)?body.applicationIds.map(Number).filter(Number.isFinite):[];
+      const applicationIds=[...new Set(Array.isArray(body.applicationIds)?body.applicationIds.map(Number).filter(Number.isFinite):[])];
       const sessionId=text(body.sessionId),status=text(body.status);
       if(!['참석','결석','보강','취소','노쇼','기타','미입력'].includes(status))throw new Error('올바른 출석 상태를 선택하세요.');
-      const sessionState=db.prepare('SELECT attendance_status FROM sessions WHERE id=?').get(sessionId) as {attendance_status:string}|undefined;if(sessionState?.attendance_status==='마감')throw new Error('마감된 회기의 출석은 수정할 수 없습니다.');
+      if(!applicationIds.length)throw new Error('출석을 입력할 참가자를 선택하세요.');
+      const sessionState=db.prepare('SELECT run_id,attendance_status FROM sessions WHERE id=?').get(sessionId) as {run_id:string;attendance_status:string}|undefined;
+      if(!sessionState)throw new Error('회기를 찾을 수 없습니다.');
+      if(sessionState.attendance_status==='마감')throw new Error('마감된 회기의 출석은 수정할 수 없습니다.');
+      const selectedApplications=db.prepare(`SELECT id,run_id FROM applications WHERE id IN (${applicationIds.map(()=>'?').join(',')})`).all(...applicationIds) as {id:number;run_id:string|null}[];
+      if(selectedApplications.length!==applicationIds.length)throw new Error('존재하지 않는 신청 기록이 포함되어 있습니다.');
+      if(selectedApplications.some(application=>application.run_id!==sessionState.run_id))throw new Error('해당 차수에 배정된 참가자만 일괄 출석을 입력할 수 있습니다.');
       db.exec('BEGIN IMMEDIATE');
       try { for(const applicationId of applicationIds){const before=db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId);db.prepare(`INSERT INTO attendance (application_id,session_id,status,note) VALUES (?,?,?,'') ON CONFLICT(application_id,session_id) DO UPDATE SET status=excluded.status`).run(applicationId,sessionId,status);logChange(db,'출석 일괄 입력','출석',`${applicationId}:${sessionId}`,before,db.prepare('SELECT * FROM attendance WHERE application_id=? AND session_id=?').get(applicationId,sessionId),`일괄 출석 상태를 ${status}(으)로 변경`,user.display_name,'',requestIp(request));}db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
     } else if (body.action === 'closeAttendanceSession') {
