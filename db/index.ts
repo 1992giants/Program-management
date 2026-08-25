@@ -154,6 +154,20 @@ function ensureDatabase(db: DatabaseSync) {
       comment TEXT NOT NULL DEFAULT '',
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS schedule_events (
+      id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL DEFAULT '상담',
+      color TEXT NOT NULL DEFAULT 'green',
+      participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      event_date TEXT NOT NULL,
+      all_day INTEGER NOT NULL DEFAULT 0,
+      start_time TEXT NOT NULL DEFAULT '',
+      end_time TEXT NOT NULL DEFAULT '',
+      recurrence TEXT NOT NULL DEFAULT '1회',
+      delivery_mode TEXT NOT NULL DEFAULT '대면',
+      created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_participants_name ON participants(name);
     CREATE INDEX IF NOT EXISTS idx_runs_program ON program_runs(program_id, round_number);
     CREATE INDEX IF NOT EXISTS idx_sessions_run_date ON sessions(run_id, session_date);
@@ -165,6 +179,8 @@ function ensureDatabase(db: DatabaseSync) {
     CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id);
     CREATE INDEX IF NOT EXISTS idx_auth_user ON auth_sessions(user_id, expires_at);
     CREATE INDEX IF NOT EXISTS idx_scores_application ON assessment_scores(application_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_events_date ON schedule_events(event_date, start_time);
+    CREATE INDEX IF NOT EXISTS idx_schedule_events_participant ON schedule_events(participant_id);
   `);
   migrateApplications(db);
   db.exec('CREATE INDEX IF NOT EXISTS idx_applications_program ON applications(program_id)');

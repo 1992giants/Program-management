@@ -59,6 +59,7 @@ function snapshot(currentUser?:SafeUser) {
     programAssessments: rows(`SELECT pa.*,a.name,a.min_score,a.max_score,a.active FROM program_assessments pa JOIN assessment_catalog a ON a.id=pa.assessment_id ORDER BY pa.program_id,pa.sort_order,a.name`),
     assessmentScores: rows(`SELECT sc.*,a.name,a.min_score,a.max_score FROM assessment_scores sc JOIN assessment_catalog a ON a.id=sc.assessment_id ORDER BY sc.updated_at DESC`),
     satisfactionSurveys: rows(`SELECT * FROM satisfaction_surveys ORDER BY updated_at DESC`),
+    scheduleEvents: rows(`SELECT e.*,p.name AS participant_name FROM schedule_events e JOIN participants p ON p.id=e.participant_id ORDER BY e.event_date DESC,e.all_day DESC,e.start_time`),
   };
 }
 
@@ -113,6 +114,16 @@ export async function POST(request:Request) {
       const before=db.prepare('SELECT * FROM sessions WHERE id=?').get(text(body.id));
       db.prepare('UPDATE sessions SET session_date=?,session_time=?,location=? WHERE id=?').run(text(body.sessionDate),text(body.sessionTime),text(body.location),text(body.id));
       logChange(db,'일정 수정','회기',text(body.id),before,db.prepare('SELECT * FROM sessions WHERE id=?').get(text(body.id)),'프로그램 회기 일정 수정',user.display_name);
+    } else if (body.action === 'createScheduleEvent') {
+      const participantId=text(body.participantId),title=text(body.title).trim(),eventDate=text(body.eventDate),eventType=text(body.eventType)||'상담',color=text(body.color)||'green',allDay=body.allDay?1:0,startTime=allDay?'':text(body.startTime),endTime=allDay?'':text(body.endTime),recurrence=text(body.recurrence)||'1회',deliveryMode=text(body.deliveryMode)||'대면';
+      if(!participantId||!title||!/^\d{4}-\d{2}-\d{2}$/.test(eventDate))throw new Error('참가자, 일정 제목과 날짜를 입력하세요.');
+      if(!db.prepare('SELECT id FROM participants WHERE id=?').get(participantId))throw new Error('참가자를 찾을 수 없습니다.');
+      if(!allDay&&(!startTime||!endTime||endTime<=startTime))throw new Error('종료시간은 시작시간보다 늦어야 합니다.');
+      if(!['상담','프로그램','기타'].includes(eventType))throw new Error('올바른 프로그램 종류를 선택하세요.');
+      if(!['green','orange','blue','purple','gray'].includes(color))throw new Error('올바른 일정 색상을 선택하세요.');
+      const id=`EVT-${String(Date.now()).slice(-10)}`,createdAt=new Date().toISOString();
+      db.prepare('INSERT INTO schedule_events (id,event_type,color,participant_id,title,event_date,all_day,start_time,end_time,recurrence,delivery_mode,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(id,eventType,color,participantId,title,eventDate,allDay,startTime,endTime,recurrence,deliveryMode,createdAt);
+      logChange(db,'일정 등록','일정',id,null,db.prepare('SELECT * FROM schedule_events WHERE id=?').get(id),`${eventDate} ${title} 일정 등록`,user.display_name);
     } else if (body.action === 'apply') {
       db.prepare(`INSERT INTO applications (participant_id,program_id,run_id,applied_at,status) VALUES (?,?,NULL,?,'신청') ON CONFLICT(participant_id,program_id) DO UPDATE SET status='신청'`).run(text(body.participantId),text(body.programId),today);
     } else if (body.action === 'assignRun') {
