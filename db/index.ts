@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 let database: DatabaseSync | null = null;
 
@@ -12,10 +12,27 @@ export function getDatabasePath() {
     : path.join(/* turbopackIgnore: true */ process.cwd(), 'data', 'onmaeum.sqlite');
 }
 
+export function getBackupDirectory() {
+  const configuredPath = process.env.ONMAEUM_BACKUP_DIR;
+  return configuredPath
+    ? path.resolve(/* turbopackIgnore: true */ configuredPath)
+    : path.join(/* turbopackIgnore: true */ path.dirname(getDatabasePath()), 'backups');
+}
+
+export function getStorageInfo() {
+  const databasePath=getDatabasePath(),backupDirectory=getBackupDirectory();
+  const networkPath=/^(\\\\|\/\/)/.test(databasePath);
+  return {databasePath,backupDirectory,networkPath,journalMode:'DELETE',architecture:'단일 서버 프로세스'};
+}
+
 export function getDatabase() {
   if (database) return database;
   const filePath = getDatabasePath();
+  if (/^(\\\\|\/\/)/.test(filePath) && process.env.ONMAEUM_ALLOW_NETWORK_DB !== '1') {
+    throw new Error('실시간 SQLite 파일은 네트워크 공유 경로에 둘 수 없습니다. 서버 PC의 로컬 경로를 사용하고 외장·네트워크 드라이브는 백업 경로로 지정하세요.');
+  }
   mkdirSync(path.dirname(filePath), { recursive: true });
+  mkdirSync(getBackupDirectory(), { recursive: true });
   database = new DatabaseSync(filePath);
   database.exec('PRAGMA foreign_keys = ON');
   // DELETE journal mode is slower than WAL but works more reliably on removable
@@ -183,6 +200,7 @@ function ensureDatabase(db: DatabaseSync) {
     CREATE INDEX IF NOT EXISTS idx_schedule_events_participant ON schedule_events(participant_id);
   `);
   migrateApplications(db);
+  migrateOperations(db);
   db.exec('CREATE INDEX IF NOT EXISTS idx_applications_program ON applications(program_id)');
   const center = db.prepare('SELECT value FROM settings WHERE key = ?').get('center_name');
   if (!center) {
@@ -199,6 +217,51 @@ function ensureDatabase(db: DatabaseSync) {
   const count = db.prepare('SELECT COUNT(*) AS count FROM participants').get() as { count:number };
   if (!count.count) seedDatabase(db);
   db.exec('PRAGMA optimize');
+}
+
+function ensureColumn(db:DatabaseSync,table:string,column:string,definition:string) {
+  const columns=db.prepare(`PRAGMA table_info(${table})`).all() as {name:string}[];
+  if(!columns.some(item=>item.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function migrateOperations(db:DatabaseSync) {
+  ensureColumn(db,'program_runs','closed_at','TEXT');
+  ensureColumn(db,'program_runs','closed_by','TEXT');
+  ensureColumn(db,'sessions','attendance_status',"TEXT NOT NULL DEFAULT '작성 중'");
+  ensureColumn(db,'sessions','attendance_closed_at','TEXT');
+  ensureColumn(db,'sessions','attendance_closed_by','TEXT');
+  ensureColumn(db,'sessions','reopen_reason',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'applications','queue_number','INTEGER');
+  ensureColumn(db,'applications','status_reason',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'applications','status_updated_at',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'applications','assigned_at','TEXT');
+  ensureColumn(db,'attendance','contacted_at','TEXT');
+  ensureColumn(db,'attendance','makeup_for_session_id','TEXT');
+  ensureColumn(db,'assessment_catalog','version',"TEXT NOT NULL DEFAULT '1.0'");
+  ensureColumn(db,'assessment_catalog','description',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'assessment_scores','pre_date','TEXT');
+  ensureColumn(db,'assessment_scores','post_date','TEXT');
+  ensureColumn(db,'assessment_scores','not_completed_reason',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'assessment_scores','assessor',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'satisfaction_surveys','survey_version',"TEXT NOT NULL DEFAULT '1.0'");
+  ensureColumn(db,'satisfaction_surveys','anonymous','INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db,'staff_users','failed_attempts','INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db,'staff_users','locked_until','TEXT');
+  ensureColumn(db,'staff_users','last_login_at','TEXT');
+  ensureColumn(db,'staff_users','pin_changed_at','TEXT');
+  ensureColumn(db,'staff_users','must_change_pin','INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db,'auth_sessions','last_seen_at','TEXT');
+  ensureColumn(db,'auth_sessions','ip_address',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'audit_logs','ip_address',"TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db,'audit_logs','reason',"TEXT NOT NULL DEFAULT ''");
+  const applications=db.prepare(`SELECT id,program_id,applied_at FROM applications WHERE queue_number IS NULL ORDER BY program_id,applied_at,id`).all() as {id:number;program_id:string}[];
+  const counters=new Map<string,number>();
+  for(const row of db.prepare(`SELECT program_id,COALESCE(MAX(queue_number),0) AS max_queue FROM applications WHERE queue_number IS NOT NULL GROUP BY program_id`).all() as {program_id:string;max_queue:number}[])counters.set(row.program_id,row.max_queue);
+  const update=db.prepare('UPDATE applications SET queue_number=?,status_updated_at=CASE WHEN status_updated_at=\'\' THEN applied_at ELSE status_updated_at END WHERE id=?');
+  for(const application of applications){const next=(counters.get(application.program_id)||0)+1;counters.set(application.program_id,next);update.run(next,application.id)}
+  db.exec('CREATE INDEX IF NOT EXISTS idx_applications_workflow ON applications(status,run_id,applied_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_attendance_status ON sessions(attendance_status,session_date)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_users_locked ON staff_users(active,locked_until)');
 }
 
 function seedDatabase(db: DatabaseSync) {
@@ -286,4 +349,11 @@ function addInterval(startDate:string, offset:number, recurrence:string) {
 }
 
 export function databaseExists() { return existsSync(getDatabasePath()); }
-export function hashPin(username:string,pin:string) { return createHash('sha256').update(`onmaeum-local|${username.trim().toLowerCase()}|${pin}`).digest('hex'); }
+function legacyPinHash(username:string,pin:string) { return createHash('sha256').update(`onmaeum-local|${username.trim().toLowerCase()}|${pin}`).digest('hex'); }
+export function hashPin(username:string,pin:string) { const salt=randomBytes(16).toString('hex');return `scrypt$${salt}$${scryptSync(pin,`onmaeum-local|${username.trim().toLowerCase()}|${salt}`,32).toString('hex')}`; }
+export function verifyPin(username:string,pin:string,stored:string) {
+  if(!stored.startsWith('scrypt$'))return stored===legacyPinHash(username,pin);
+  const parts=stored.split('$'),salt=parts.length===3?`onmaeum-local|${username.trim().toLowerCase()}|${parts[1]}`:`onmaeum-local|${username.trim().toLowerCase()}`,hash=parts.length===3?parts[2]:parts[1];
+  const expected=Buffer.from(hash,'hex'),actual=scryptSync(pin,salt,32);
+  return expected.length===actual.length&&timingSafeEqual(expected,actual);
+}
