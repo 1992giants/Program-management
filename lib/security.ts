@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 
 export type StaffRole='관리자'|'일반 담당자'|'출석 입력 전용';
 export type SafeUser={id:string;username:string;display_name:string;role:string;active:number;must_change_pin?:number;last_login_at?:string|null};
+export const SESSION_COOKIE_NAME='onmaeum_session';
 
 const ADMIN_ACTIONS=[
   'createParticipant','updateParticipant','createProgram','createRun','updateProgram','updateRunStatus','updateSession','createScheduleEvent',
@@ -30,30 +31,70 @@ export function canPerformAction(user:Pick<SafeUser,'role'>,action:string) {
     && ALLOWED_ACTIONS[user.role as StaffRole].has(action);
 }
 
-export function bearerToken(request:Request) {
-  return request.headers.get('authorization')?.replace(/^Bearer\s+/i,'').trim()||'';
+export function sessionSecret(request:Request) {
+  const cookie=request.headers.get('cookie')||'';
+  for(const part of cookie.split(';')){
+    const separator=part.indexOf('=');
+    if(separator<0)continue;
+    if(part.slice(0,separator).trim()===SESSION_COOKIE_NAME)return part.slice(separator+1).trim();
+  }
+  return '';
+}
+
+export function sessionTokenDigest(secret:string) {
+  return createHash('sha256').update(secret).digest('hex');
+}
+
+export function secureCookiesEnabled() {
+  return process.env.ONMAEUM_SECURE_COOKIES==='1';
+}
+
+export function sessionCookie(secret:string) {
+  return `${SESSION_COOKIE_NAME}=${secret}; HttpOnly; SameSite=Strict; Path=/${secureCookiesEnabled()?'; Secure':''}`;
+}
+
+export function expiredSessionCookie() {
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secureCookiesEnabled()?'; Secure':''}`;
+}
+
+export function allowedOrigins() {
+  const configured=(process.env.ONMAEUM_ALLOWED_ORIGINS||'').split(',').map(value=>value.trim()).filter(Boolean);
+  if(configured.length)return new Set(configured.map(value=>new URL(value).origin));
+  if(process.env.NODE_ENV==='production')return new Set<string>();
+  return new Set(['http://localhost:3000','http://127.0.0.1:3000']);
+}
+
+export function validateMutationRequest(request:Request) {
+  const contentType=request.headers.get('content-type')?.split(';',1)[0]?.trim().toLowerCase();
+  if(contentType!=='application/json')return {status:415,error:'unsupported_media_type'} as const;
+  const origin=request.headers.get('origin');
+  if(!origin||!allowedOrigins().has(origin))return {status:403,error:'forbidden_origin'} as const;
+  return undefined;
 }
 
 export function getAuthenticatedUser(request:Request,db:DatabaseSync) {
-  const token=bearerToken(request);
-  if(!token)return undefined;
+  const secret=sessionSecret(request);
+  if(!secret)return undefined;
+  const token=sessionTokenDigest(secret);
   const now=new Date().toISOString();
-  const user=db.prepare(`SELECT u.id,u.username,u.display_name,u.role,u.active,u.must_change_pin,u.last_login_at FROM auth_sessions s JOIN staff_users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>? AND u.active=1`).get(token,now) as SafeUser|undefined;
-  if(user)db.prepare('UPDATE auth_sessions SET last_seen_at=? WHERE token=?').run(now,token);
-  return user;
+  const row=db.prepare(`SELECT u.id,u.username,u.display_name,u.role,u.active,u.must_change_pin,u.last_login_at,s.expires_at FROM auth_sessions s JOIN staff_users u ON u.id=s.user_id WHERE s.token=?`).get(token) as (SafeUser&{expires_at:string})|undefined;
+  if(!row)return undefined;
+  if(!row.active||row.expires_at<=now){db.prepare('DELETE FROM auth_sessions WHERE token=?').run(token);return undefined;}
+  db.prepare('UPDATE auth_sessions SET last_seen_at=? WHERE token=?').run(now,token);
+  return {id:row.id,username:row.username,display_name:row.display_name,role:row.role,active:row.active,must_change_pin:row.must_change_pin,last_login_at:row.last_login_at};
 }
 
 export function createAuthSession(db:DatabaseSync,userId:string,ipAddress:string) {
-  const token=randomUUID(),createdAt=new Date().toISOString(),expiresAt=new Date(Date.now()+8*60*60*1000).toISOString();
+  const secret=randomBytes(32).toString('base64url'),token=sessionTokenDigest(secret),createdAt=new Date().toISOString(),expiresAt=new Date(Date.now()+8*60*60*1000).toISOString();
   db.prepare('DELETE FROM auth_sessions WHERE expires_at<=?').run(createdAt);
   db.prepare('INSERT INTO auth_sessions (token,user_id,expires_at,created_at,last_seen_at,ip_address) VALUES (?,?,?,?,?,?)').run(token,userId,expiresAt,createdAt,createdAt,ipAddress);
-  return {token,createdAt,expiresAt};
+  return {secret,createdAt,expiresAt};
 }
 
 export function invalidateAuthSession(request:Request,db:DatabaseSync) {
-  const token=bearerToken(request);
-  if(!token)return false;
-  return db.prepare('DELETE FROM auth_sessions WHERE token=?').run(token).changes>0;
+  const secret=sessionSecret(request);
+  if(!secret)return false;
+  return db.prepare('DELETE FROM auth_sessions WHERE token=?').run(sessionTokenDigest(secret)).changes>0;
 }
 
 export function attendanceOnlySnapshot(db:DatabaseSync,currentUser:SafeUser) {
