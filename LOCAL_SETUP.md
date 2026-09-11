@@ -11,6 +11,13 @@
 5. bootstrap 값을 제거한 다음 `start-center.ps1`을 별도로 실행해야 평상시 운영 서버가 시작됩니다.
 6. 서버 PC에서는 `http://localhost:3000`, 다른 내부 PC에서는 `http://서버PC의-내부-IP:3000`으로 접속합니다.
 
+## 인증 Cookie와 내부망 HTTP
+
+- `.env.local`의 `ONMAEUM_ALLOWED_ORIGINS`에는 직원이 실제로 접속하는 주소를 정확히 쉼표로 구분해 입력합니다. 예: `http://localhost:3000,http://192.168.0.10:3000`
+- 현재 내부망 HTTP 운영에서는 `ONMAEUM_SECURE_COOKIES=0`을 사용합니다. 인증 Cookie는 HttpOnly·SameSite=Strict로 보호되지만 HTTP 네트워크 구간 자체는 암호화되지 않습니다.
+- 같은 내부망의 감염 PC나 악성 장비가 통신을 가로채는 위험을 줄이려면 HTTPS reverse proxy와 센터 PC의 인증서 신뢰 구성을 별도 도입해야 합니다.
+- HTTPS가 실제 적용된 뒤에만 `ONMAEUM_SECURE_COOKIES=1`로 변경합니다. forwarded header 값만 보고 Secure 설정을 자동 활성화하지 않습니다.
+
 ## 최초 관리자 만들기
 
 고정된 기본 관리자 계정은 제공되지 않습니다. 새 DB를 처음 시작할 때 `.env.local`에 다음 세 값을 직접 정해 한 번만 설정하세요.

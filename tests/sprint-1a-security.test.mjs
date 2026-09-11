@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -7,7 +7,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import { hashPin, verifyPin } from '../db/index.ts';
-import { attendanceOnlySnapshot, canPerformAction, createAuthSession, getAuthenticatedUser, invalidateAuthSession } from '../lib/security.ts';
+import { SESSION_COOKIE_NAME, attendanceOnlySnapshot, canPerformAction, createAuthSession, getAuthenticatedUser, invalidateAuthSession, sessionCookie, sessionTokenDigest, validateMutationRequest } from '../lib/security.ts';
 
 const projectRoot=path.resolve(import.meta.dirname,'..');
 
@@ -308,7 +308,7 @@ test('출석 전용 snapshot은 출석 업무에 불필요한 민감정보를 �
   } finally { db.close(); }
 });
 
-test('로그인 검증 후 만든 session은 logout 즉시 재사용할 수 없다',()=>{
+test('Cookie session은 digest로 저장되고 logout 즉시 재사용할 수 없다',()=>{
   const db=new DatabaseSync(':memory:');
   db.exec(`
     CREATE TABLE staff_users(id TEXT PRIMARY KEY,username TEXT,display_name TEXT,pin_hash TEXT,role TEXT,active INTEGER,must_change_pin INTEGER,last_login_at TEXT);
@@ -318,11 +318,56 @@ test('로그인 검증 후 만든 session은 logout 즉시 재사용할 수 없�
   db.prepare('INSERT INTO staff_users VALUES (?,?,?,?,?,1,0,NULL)').run('U-1','attendance','출석 담당',stored,'출석 입력 전용');
   assert.equal(verifyPin('attendance','48261590',stored),true);
   const session=createAuthSession(db,'U-1','local');
-  const request=new Request('http://localhost/api/data',{headers:{Authorization:`Bearer ${session.token}`}});
+  const request=new Request('http://localhost/api/data',{headers:{Cookie:`${SESSION_COOKIE_NAME}=${session.secret}`}});
+  const storedToken=db.prepare('SELECT token FROM auth_sessions').get().token;
+  assert.equal(storedToken,sessionTokenDigest(session.secret));
+  assert.notEqual(storedToken,session.secret);
   assert.equal(getAuthenticatedUser(request,db)?.id,'U-1');
   assert.equal(invalidateAuthSession(request,db),true);
   assert.equal(getAuthenticatedUser(request,db),undefined);
+  assert.equal(getAuthenticatedUser(new Request('http://localhost/api/data',{headers:{Authorization:`Bearer ${session.secret}`}}),db),undefined);
+  db.prepare('INSERT INTO auth_sessions VALUES (?,?,?,?,?,?)').run('legacy-raw-token','U-1','2999-01-01T00:00:00.000Z',new Date().toISOString(),new Date().toISOString(),'local');
+  assert.equal(getAuthenticatedUser(new Request('http://localhost/api/data',{headers:{Cookie:`${SESSION_COOKIE_NAME}=legacy-raw-token`}}),db),undefined);
   db.close();
+});
+
+test('session Cookie는 HTTP와 HTTPS 설정에 맞는 속성을 사용한다',()=>{
+  const original=process.env.ONMAEUM_SECURE_COOKIES;
+  try {
+    process.env.ONMAEUM_SECURE_COOKIES='0';
+    const httpCookie=sessionCookie('secret');
+    assert.match(httpCookie,/HttpOnly/);
+    assert.match(httpCookie,/SameSite=Strict/);
+    assert.match(httpCookie,/Path=\//);
+    assert.doesNotMatch(httpCookie,/; Secure/);
+    assert.doesNotMatch(httpCookie,/Max-Age|Expires/);
+    process.env.ONMAEUM_SECURE_COOKIES='1';
+    assert.match(sessionCookie('secret'),/; Secure/);
+  } finally {
+    if(original===undefined)delete process.env.ONMAEUM_SECURE_COOKIES;else process.env.ONMAEUM_SECURE_COOKIES=original;
+  }
+});
+
+test('production mutation은 명시적인 exact Origin과 JSON만 허용한다',()=>{
+  const originalNodeEnv=process.env.NODE_ENV,originalOrigins=process.env.ONMAEUM_ALLOWED_ORIGINS;
+  try {
+    process.env.NODE_ENV='production';
+    delete process.env.ONMAEUM_ALLOWED_ORIGINS;
+    const jsonHeaders={'Content-Type':'application/json'};
+    assert.equal(validateMutationRequest(new Request('http://localhost/api/data',{method:'POST',headers:{...jsonHeaders,Origin:'http://localhost:3000'}}))?.status,403);
+    process.env.ONMAEUM_ALLOWED_ORIGINS='http://localhost:3000,http://127.0.0.1:3000';
+    assert.equal(validateMutationRequest(new Request('http://localhost/api/data',{method:'POST',headers:{...jsonHeaders,Origin:'http://localhost:3000'}})),undefined);
+    assert.equal(validateMutationRequest(new Request('http://localhost/api/data',{method:'POST',headers:{...jsonHeaders,Origin:'http://localhost:3000.attacker.invalid'}}))?.status,403);
+    assert.equal(validateMutationRequest(new Request('http://localhost/api/data',{method:'POST',headers:{Origin:'http://localhost:3000','Content-Type':'text/plain'}}))?.status,415);
+  } finally {
+    if(originalNodeEnv===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=originalNodeEnv;
+    if(originalOrigins===undefined)delete process.env.ONMAEUM_ALLOWED_ORIGINS;else process.env.ONMAEUM_ALLOWED_ORIGINS=originalOrigins;
+  }
+});
+
+test('client 인증 코드에는 legacy localStorage token이 남지 않는다',()=>{
+  const clientSource=readFileSync(path.join(projectRoot,'app/page.tsx'),'utf8');
+  for(const legacy of ['onmaeum_auth','localStorage','Authorization','Bearer ','authToken'])assert.equal(clientSource.includes(legacy),false,legacy);
 });
 
 test('실제 API는 attendance 최소 응답, 권한 거부, 일괄 출석 원자성, logout 폐기를 보장한다',()=>{
@@ -332,9 +377,13 @@ test('실제 API는 attendance 최소 응답, 권한 거부, 일괄 출석 원�
     import assert from 'node:assert/strict';
     import { GET, POST } from './app/api/data/route.ts';
     import { getDatabase, hashPin } from './db/index.ts';
+    import { SESSION_COOKIE_NAME, sessionTokenDigest } from './lib/security.ts';
 
     const db=getDatabase(),today='2026-08-25';
     db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,must_change_pin) VALUES (?,?,?,?,?,1,?,0)').run('USR-ATTENDANCE','attendance','출석 담당',hashPin('attendance','48261590'),'출석 입력 전용',today);
+    db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,must_change_pin) VALUES (?,?,?,?,?,1,?,0)').run('USR-ROUTE-ADMIN','route-admin','통합 관리자',hashPin('route-admin','86420975'),'관리자',today);
+    db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,must_change_pin) VALUES (?,?,?,?,?,0,?,0)').run('USR-INACTIVE','inactive-user','중지 계정',hashPin('inactive-user','86420975'),'일반 담당자',today);
+    db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,must_change_pin,locked_until) VALUES (?,?,?,?,?,1,?,0,?)').run('USR-LOCKED','locked-user','잠긴 계정',hashPin('locked-user','86420975'),'일반 담당자',today,'2999-01-01T00:00:00.000Z');
     db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run('P-1','홍길동','남성',40,'010-9876-5432','회원','participant-secret-memo',today);
     db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run('P-2','김다른','여성',35,'010-1111-2222','비회원','other-secret-memo',today);
     db.prepare('INSERT INTO programs (id,name,category,delivery_type,session_count,recurrence,location,manager,capacity,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run('PRG-1','회복 프로그램','회복','집단',1,'매주','프로그램실','담당자',10,'운영 중',today);
@@ -351,15 +400,43 @@ test('실제 API는 attendance 최소 응답, 권한 거부, 일괄 출석 원�
     db.prepare('INSERT INTO schedule_events (id,event_type,color,participant_id,title,event_date,created_at) VALUES (?,?,?,?,?,?,?)').run('EVENT-1','상담','green','P-1','unrelated-secret-schedule',today,new Date().toISOString());
     db.prepare('INSERT INTO audit_logs (created_at,actor,action,entity_type,entity_id,summary) VALUES (?,?,?,?,?,?)').run(new Date().toISOString(),'관리자','민감 작업','참가자','P-1','audit-secret-summary');
 
-    const post=(body,token)=>POST(new Request('http://localhost/api/data',{method:'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:JSON.stringify(body)}));
-    const get=token=>GET(new Request('http://localhost/api/data',{headers:{Authorization:'Bearer '+token}}));
+    const origin='http://localhost:3000';
+    const post=(body,cookie,headers={})=>POST(new Request(origin+'/api/data',{method:'POST',headers:{'Content-Type':'application/json',Origin:origin,...(cookie?{Cookie:cookie}:{}),...headers},body:JSON.stringify(body)}));
+    const get=(cookie,headers={})=>GET(new Request(origin+'/api/data',{headers:{...(cookie?{Cookie:cookie}:{}),...headers}}));
+    const cookieFrom=response=>response.headers.get('set-cookie').split(';')[0];
+
+    const badOrigin=await post({action:'login',username:'attendance',pin:'48261590'},'',{Origin:'http://attacker.invalid'});
+    assert.equal(badOrigin.status,403);
+    const missingOrigin=await POST(new Request(origin+'/api/data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'login',username:'attendance',pin:'48261590'})}));
+    assert.equal(missingOrigin.status,403);
+    const badContentType=await POST(new Request(origin+'/api/data',{method:'POST',headers:{Origin:origin,'Content-Type':'text/plain'},body:JSON.stringify({action:'login',username:'attendance',pin:'48261590'})}));
+    assert.equal(badContentType.status,415);
+
+    const loginFailures=[];
+    for(const credentials of [{username:'missing-user',pin:'00000000'},{username:'attendance',pin:'00000000'},{username:'locked-user',pin:'86420975'},{username:'inactive-user',pin:'86420975'}]){
+      const response=await post({action:'login',...credentials});
+      loginFailures.push({status:response.status,body:await response.json()});
+    }
+    for(const failure of loginFailures)assert.deepEqual(failure,loginFailures[0]);
+
     const loginResponse=await post({action:'login',username:'attendance',pin:'48261590'});
     assert.equal(loginResponse.status,200);
-    const loginBody=await loginResponse.json(),token=loginBody.authToken;
-    assert.ok(token);
+    assert.equal(loginResponse.headers.get('cache-control'),'no-store');
+    const setCookie=loginResponse.headers.get('set-cookie');
+    assert.match(setCookie,/HttpOnly/);
+    assert.match(setCookie,/SameSite=Strict/);
+    assert.match(setCookie,/Path=\\//);
+    assert.doesNotMatch(setCookie,/; Secure/);
+    const loginBody=await loginResponse.json(),cookie=cookieFrom(loginResponse),rawSecret=cookie.slice(SESSION_COOKIE_NAME.length+1);
+    assert.equal(Object.hasOwn(loginBody,'authToken'),false);
+    assert.equal(JSON.stringify(loginBody).includes(rawSecret),false);
+    const storedSession=db.prepare('SELECT token FROM auth_sessions WHERE user_id=?').get('USR-ATTENDANCE').token;
+    assert.equal(storedSession,sessionTokenDigest(rawSecret));
+    assert.notEqual(storedSession,rawSecret);
 
-    const protectedResponse=await get(token);
+    const protectedResponse=await get(cookie);
     assert.equal(protectedResponse.status,200);
+    assert.equal(protectedResponse.headers.get('cache-control'),'no-store');
     const attendanceBody=await protectedResponse.json(),serialized=JSON.stringify(attendanceBody);
     assert.equal(attendanceBody.currentUser.role,'출석 입력 전용');
     assert.deepEqual(attendanceBody.participants,[]);
@@ -377,23 +454,65 @@ test('실제 API는 attendance 최소 응답, 권한 거부, 일괄 출석 원�
     assert.equal(Object.hasOwn(attendanceBody.applications[0],'age'),false);
     for(const secret of ['010-9876-5432','participant-secret-memo','application-secret-reason','assessment-secret-note','satisfaction-secret-free-text','audit-secret-summary','unrelated-secret-schedule'])assert.equal(serialized.includes(secret),false);
 
-    const validBulk=await post({action:'attendanceBulk',sessionId:'SESSION-1',applicationIds:[1],status:'참석'},token);
+    const bearerOnly=await get('',{Authorization:'Bearer '+rawSecret});
+    assert.equal(bearerOnly.status,401);
+
+    const validBulk=await post({action:'attendanceBulk',sessionId:'SESSION-1',applicationIds:[1],status:'참석'},cookie);
     assert.equal(validBulk.status,200);
     assert.equal(db.prepare('SELECT status FROM attendance WHERE application_id=1 AND session_id=?').get('SESSION-1').status,'참석');
 
-    const invalidBulk=await post({action:'attendanceBulk',sessionId:'SESSION-1',applicationIds:[1,2],status:'결석'},token);
+    const invalidBulk=await post({action:'attendanceBulk',sessionId:'SESSION-1',applicationIds:[1,2],status:'결석'},cookie);
     assert.notEqual(invalidBulk.status,200);
     assert.equal(db.prepare('SELECT status FROM attendance WHERE application_id=1 AND session_id=?').get('SESSION-1').status,'참석');
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM attendance WHERE application_id=2 AND session_id=?').get('SESSION-1').count,0);
 
     for(const action of ['backup','restoreBackup','mergeParticipants']){
-      const denied=await post({action,path:'not-used',keepId:'P-1',mergeId:'P-2'},token);
+      const denied=await post({action,path:'not-used',keepId:'P-1',mergeId:'P-2'},cookie);
       assert.equal(denied.status,403);
     }
 
-    const logout=await post({action:'logout'},token);
+    const adminLogin=await post({action:'login',username:'route-admin',pin:'86420975'}),adminCookie=cookieFrom(adminLogin);
+    assert.equal(adminLogin.status,200);
+    const duplicateUser=await post({action:'createUser',username:'route-admin',displayName:'중복',pin:'97531086',role:'일반 담당자'},adminCookie);
+    assert.equal(duplicateUser.status,500);
+    assert.deepEqual(await duplicateUser.json(),{error:'internal_server_error'});
+
+    const roleChanged=await post({action:'updateUser',id:'USR-ATTENDANCE',displayName:'출석 담당',role:'일반 담당자',active:true,pin:''},adminCookie);
+    assert.equal(roleChanged.status,200);
+    assert.equal((await get(cookie)).status,401);
+
+    const reloginAfterRole=await post({action:'login',username:'attendance',pin:'48261590'}),roleCookie=cookieFrom(reloginAfterRole);
+    const disabled=await post({action:'updateUser',id:'USR-ATTENDANCE',displayName:'출석 담당',role:'일반 담당자',active:false,pin:''},adminCookie);
+    assert.equal(disabled.status,200);
+    assert.equal((await get(roleCookie)).status,401);
+
+    await post({action:'updateUser',id:'USR-ATTENDANCE',displayName:'출석 담당',role:'일반 담당자',active:true,pin:''},adminCookie);
+    const beforeReset=await post({action:'login',username:'attendance',pin:'48261590'}),resetCookie=cookieFrom(beforeReset);
+    const reset=await post({action:'updateUser',id:'USR-ATTENDANCE',displayName:'출석 담당',role:'일반 담당자',active:true,pin:'13579024'},adminCookie);
+    assert.equal(reset.status,200);
+    assert.equal((await get(resetCookie)).status,401);
+
+    const temporaryLogin=await post({action:'login',username:'attendance',pin:'13579024'}),temporaryCookie=cookieFrom(temporaryLogin);
+    const ownPinChange=await post({action:'changeMyPin',currentPin:'13579024',newPin:'24680135'},temporaryCookie);
+    assert.equal(ownPinChange.status,200);
+    assert.equal((await ownPinChange.json()).loginRequired,true);
+    assert.match(ownPinChange.headers.get('set-cookie'),/Max-Age=0/);
+    assert.equal((await get(temporaryCookie)).status,401);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id=?').get('USR-ATTENDANCE').count,0);
+
+    const expiredLogin=await post({action:'login',username:'attendance',pin:'24680135'}),expiredCookie=cookieFrom(expiredLogin),expiredSecret=expiredCookie.slice(SESSION_COOKIE_NAME.length+1);
+    db.prepare('UPDATE auth_sessions SET expires_at=? WHERE token=?').run('2000-01-01T00:00:00.000Z',sessionTokenDigest(expiredSecret));
+    const expiredResponse=await get(expiredCookie);
+    assert.equal(expiredResponse.status,401);
+    assert.match(expiredResponse.headers.get('set-cookie'),/Max-Age=0/);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_sessions WHERE token=?').get(sessionTokenDigest(expiredSecret)).count,0);
+
+    const logoutLogin=await post({action:'login',username:'attendance',pin:'24680135'}),logoutCookie=cookieFrom(logoutLogin);
+    const logout=await post({action:'logout'},logoutCookie);
     assert.equal(logout.status,200);
-    const reused=await get(token);
+    assert.equal(logout.headers.get('cache-control'),'no-store');
+    assert.match(logout.headers.get('set-cookie'),/Max-Age=0/);
+    const reused=await get(logoutCookie);
     assert.equal(reused.status,401);
     console.log(JSON.stringify({ok:true}));
   `;
