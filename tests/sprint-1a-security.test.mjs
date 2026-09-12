@@ -269,7 +269,7 @@ test('USR-ADMIN은 자동 교체하지 않고 명시적 migration에서 같은 I
 test('authorization은 역할별 explicit allow, default deny를 적용한다',()=>{
   const attendance={role:'출석 입력 전용'};
   for(const action of ['attendance','attendanceBulk','closeAttendanceSession'])assert.equal(canPerformAction(attendance,action),true);
-  for(const action of ['createUser','updateUser','backup','checkBackup','restoreBackup','mergeParticipants','settings','unknownAction'])assert.equal(canPerformAction(attendance,action),false);
+  for(const action of ['createUser','updateUser','backup','checkBackup','restoreBackup','mergeParticipants','settings','recordAccess','unknownAction'])assert.equal(canPerformAction(attendance,action),false);
   assert.equal(canPerformAction({role:'관리자'},'restoreBackup'),true);
   assert.equal(canPerformAction({role:'알 수 없는 역할'},'attendance'),false);
 });

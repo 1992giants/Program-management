@@ -72,6 +72,16 @@ PowerShell에서 경로를 직접 지정해 실행할 수도 있습니다.
 
 ## 운영 주의사항
 
+### 기존 감사로그 민감정보 진단
+
+기존 감사로그에서 민감 payload 가능성이 있는 행을 내용 노출 없이 작업·대상별 건수로 확인할 수 있습니다.
+
+```powershell
+npm run audit:scan -- --database "C:\OnmaeumProgramCare\data\onmaeum.sqlite"
+```
+
+이 명령은 DB를 읽기 전용으로 열고 의심 건수만 출력합니다. 기존 감사로그를 수정·삭제하거나 자동 정리하지 않습니다. 결과가 0건이어도 휴리스틱 진단상 후보가 없다는 의미이며 민감정보가 절대 없음을 보증하지 않습니다.
+
 - 운영 DB를 UNC 공유경로에 두지 마세요. SQLite 파일은 서버 PC에서만 열고 직원 PC는 브라우저로 접속합니다.
 - 운영 서버는 `ONMAEUM_DB_PATH`가 없으면 시작되지 않습니다. 개발 서버는 이 값을 사용하지 않고 `ONMAEUM_DEV_DB_PATH` 또는 별도의 기본 `data/development.sqlite`를 사용합니다.
 - production 일반 실행은 기존 DB만 열며, 신규 DB 생성·기존 DB adoption·USR-ADMIN migration은 서로 다른 명시적 일회성 모드로 구분됩니다.

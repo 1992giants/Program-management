@@ -18,7 +18,7 @@ const GENERAL_ACTIONS=[
   'addAssessmentType','setAssessmentActive','setProgramAssessments','saveAssessmentScore','saveSatisfaction','certificate','import','logout',
 ] as const;
 
-const ATTENDANCE_ACTIONS=['attendance','attendanceBulk','closeAttendanceSession','changeMyPin','recordAccess','logout'] as const;
+const ATTENDANCE_ACTIONS=['attendance','attendanceBulk','closeAttendanceSession','changeMyPin','logout'] as const;
 
 const ALLOWED_ACTIONS:Record<StaffRole,ReadonlySet<string>>={
   '관리자':new Set(ADMIN_ACTIONS),

@@ -12,7 +12,8 @@
     "test": "node --test tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
-    "verify-db": "node scripts/verify-db.mjs"
+    "verify-db": "node scripts/verify-db.mjs",
+    "audit:scan": "node scripts/audit-sensitive-scan.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
