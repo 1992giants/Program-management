@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync } from 'node:fs';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import { getDatabasePath } from '../db/index.ts';
 
@@ -21,16 +22,23 @@ function parsesToSensitivePayload(raw){
   try{return containsSensitiveKey(JSON.parse(raw));}catch{return false;}
 }
 
+function suspiciousAuditIp(raw){
+  const value=String(raw||'').trim();
+  return Boolean(value)&&value!=='local'&&isIP(value)===0;
+}
+
 const databaseArgumentIndex=process.argv.indexOf('--database');
 const databasePath=databaseArgumentIndex>=0?process.argv[databaseArgumentIndex+1]:getDatabasePath();
 if(!databasePath||!path.isAbsolute(databasePath))throw new Error('진단할 DB의 절대경로를 --database 인수 또는 현재 환경의 DB 경로로 지정하세요.');
 if(!existsSync(databasePath))throw new Error('진단할 DB 파일이 존재하지 않습니다.');
 const db=new DatabaseSync(databasePath,{readOnly:true});
-const rows=db.prepare('SELECT action,entity_type,before_json,after_json,summary,reason FROM audit_logs').all();
+const auditColumns=new Set(db.prepare('PRAGMA table_info(audit_logs)').all().map(row=>row.name));
+const ipSelection=auditColumns.has('ip_address')?'ip_address':"'' AS ip_address";
+const rows=db.prepare(`SELECT action,entity_type,before_json,after_json,summary,reason,${ipSelection} FROM audit_logs`).all();
 const groups=new Map();
 for(const row of rows){
-  const riskySummary=Boolean(row.summary)&&freeTextSummaryEntities.has(row.entity_type);
-  if(!parsesToSensitivePayload(row.before_json)&&!parsesToSensitivePayload(row.after_json)&&!riskySummary&&!row.reason)continue;
+  const riskySummary=Boolean(row.summary)&&freeTextSummaryEntities.has(row.entity_type),riskyIp=suspiciousAuditIp(row.ip_address);
+  if(!parsesToSensitivePayload(row.before_json)&&!parsesToSensitivePayload(row.after_json)&&!riskySummary&&!row.reason&&!riskyIp)continue;
   const key=`${row.action}\u0000${row.entity_type}`;
   groups.set(key,(groups.get(key)||0)+1);
 }

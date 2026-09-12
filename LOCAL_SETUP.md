@@ -82,6 +82,14 @@ npm run audit:scan -- --database "C:\OnmaeumProgramCare\data\onmaeum.sqlite"
 
 이 명령은 DB를 읽기 전용으로 열고 의심 건수만 출력합니다. 기존 감사로그를 수정·삭제하거나 자동 정리하지 않습니다. 결과가 0건이어도 휴리스틱 진단상 후보가 없다는 의미이며 민감정보가 절대 없음을 보증하지 않습니다.
 
+### Excel 반출 보안 범위
+
+공식 신청 운영명단과 연락용 명단은 서버에서 역할과 프로그램·차수 범위를 확인한 뒤 고정된 최소 컬럼으로 생성하며, 생성 사실은 참가자 원문 없이 감사로그에 기록됩니다. 일반 담당자는 프로그램 또는 차수 범위가 있는 신청 운영명단만, 관리자는 신청 운영명단과 범위가 지정된 연락용 명단을 생성할 수 있습니다. 출석 입력 전용 계정은 사용할 수 없습니다.
+
+이번 조치는 공식 Excel export 경로의 권한·범위·감사를 강화합니다. 일반 담당자의 기존 `/api/data` base snapshot 접근범위 최소화는 별도 security task이며, 브라우저에서 이미 접근 가능한 데이터를 개발자 도구 등으로 복사하는 행위까지 기술적으로 차단하는 것은 아닙니다.
+
+현재 감사로그의 `ip_address`는 `local` sentinel로 기록됩니다. 신뢰 가능한 reverse proxy가 도입되기 전에는 실제 네트워크 source IP를 증명하지 않으며, forensic-grade IP attribution으로 해석하면 안 됩니다.
+
 - 운영 DB를 UNC 공유경로에 두지 마세요. SQLite 파일은 서버 PC에서만 열고 직원 PC는 브라우저로 접속합니다.
 - 운영 서버는 `ONMAEUM_DB_PATH`가 없으면 시작되지 않습니다. 개발 서버는 이 값을 사용하지 않고 `ONMAEUM_DEV_DB_PATH` 또는 별도의 기본 `data/development.sqlite`를 사용합니다.
 - production 일반 실행은 기존 DB만 열며, 신규 DB 생성·기존 DB adoption·USR-ADMIN migration은 서로 다른 명시적 일회성 모드로 구분됩니다.
