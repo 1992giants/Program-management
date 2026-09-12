@@ -138,31 +138,32 @@ test('감사로그는 관리자 전용이며 민감 원문과 credential을 복�
   }finally{rmSync(directory,{recursive:true,force:true});}
 });
 
-test('legacy 감사 진단은 의심 건수만 출력하고 원문을 노출하거나 수정하지 않는다',()=>{
+test('legacy 감사 진단은 payload와 비정상 IP 의심 건수만 출력하고 원문을 노출하거나 수정하지 않는다',()=>{
   const directory=mkdtempSync(path.join(tmpdir(),'onmaeum-audit-scan-')),databasePath=path.join(directory,'legacy.sqlite'),missingPath=path.join(directory,'missing.sqlite');
-  const secret='legacy-sensitive-content-that-must-not-print',titleSecret='legacy-title-that-must-not-print',summarySecret='legacy-summary-that-must-not-print';
+  const secret='legacy-sensitive-content-that-must-not-print',titleSecret='legacy-title-that-must-not-print',summarySecret='legacy-summary-that-must-not-print',ipSecrets=['legacy-session-secret','비정상 IP 메모 문자열','C:/private/legacy/database.sqlite'];
   try{
     const db=new DatabaseSync(databasePath);
-    db.exec(`CREATE TABLE audit_logs (id INTEGER PRIMARY KEY,action TEXT,entity_type TEXT,before_json TEXT,after_json TEXT,summary TEXT,reason TEXT)`);
-    const insert=db.prepare('INSERT INTO audit_logs (action,entity_type,before_json,after_json,summary,reason) VALUES (?,?,?,?,?,?)');
-    insert.run('수정','참가자',JSON.stringify({phone:secret}),'','','');
-    insert.run('일정 등록','일정','',JSON.stringify({title:titleSecret}),'','');
-    insert.run('일정 등록','일정','','',summarySecret,'');
+    db.exec(`CREATE TABLE audit_logs (id INTEGER PRIMARY KEY,action TEXT,entity_type TEXT,before_json TEXT,after_json TEXT,summary TEXT,reason TEXT,ip_address TEXT)`);
+    const insert=db.prepare('INSERT INTO audit_logs (action,entity_type,before_json,after_json,summary,reason,ip_address) VALUES (?,?,?,?,?,?,?)');
+    insert.run('수정','참가자',JSON.stringify({phone:secret}),'','','','local');
+    insert.run('일정 등록','일정','',JSON.stringify({title:titleSecret}),'','','127.0.0.1');
+    insert.run('일정 등록','일정','','',summarySecret,'','::1');
+    for(const ipValue of ipSecrets)insert.run('export_generated','export','','','','',ipValue);
     db.close();
     const beforeBytes=readFileSync(databasePath),missingResult=spawnSync(process.execPath,['scripts/audit-sensitive-scan.mjs','--database',missingPath],{cwd:projectRoot,encoding:'utf8'});
     assert.notEqual(missingResult.status,0);
     assert.equal(existsSync(missingPath),false);
     const result=spawnSync(process.execPath,['scripts/audit-sensitive-scan.mjs','--database',databasePath],{cwd:projectRoot,encoding:'utf8'});
     assert.equal(result.status,0,result.stderr);
-    for(const value of [secret,titleSecret,summarySecret])assert.equal(result.stdout.includes(value),false);
+    for(const value of [secret,titleSecret,summarySecret,...ipSecrets])assert.equal(result.stdout.includes(value),false);
     const report=JSON.parse(result.stdout);
-    assert.equal(report.total_rows,3);
-    assert.equal(report.suspected_rows,3);
-    assert.deepEqual(report.groups,[{action:'일정 등록',entity_type:'일정',count:2},{action:'수정',entity_type:'참가자',count:1}]);
+    assert.equal(report.total_rows,6);
+    assert.equal(report.suspected_rows,6);
+    assert.deepEqual(report.groups,[{action:'export_generated',entity_type:'export',count:3},{action:'일정 등록',entity_type:'일정',count:2},{action:'수정',entity_type:'참가자',count:1}]);
     assert.equal(report.interpretation,'heuristic_candidates_not_proof_of_absence');
     assert.deepEqual(readFileSync(databasePath),beforeBytes);
     const verify=new DatabaseSync(databasePath,{readOnly:true});
-    assert.equal(verify.prepare('SELECT COUNT(*) AS count FROM audit_logs').get().count,3);
+    assert.equal(verify.prepare('SELECT COUNT(*) AS count FROM audit_logs').get().count,6);
     verify.close();
   }finally{rmSync(directory,{recursive:true,force:true});}
 });

@@ -17,7 +17,7 @@ function internalError(error:unknown) { console.error('[api/data] internal error
 function rows(sql:string, ...params:SQLInputValue[]) { return getDatabase().prepare(sql).all(...params); }
 const text = (value:unknown) => String(value ?? '');
 function nextQueueNumber(db:DatabaseSync,programId:string){return ((db.prepare('SELECT COALESCE(MAX(queue_number),0)+1 AS next FROM applications WHERE program_id=?').get(programId) as {next:number}).next)||1}
-function requestIp(request:Request){return request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()||request.headers.get('x-real-ip')||'local'}
+function requestIp(request:Request){void request;return 'local'}
 
 const NEVER_AUDIT_KEYS=new Set(['pin','pin_hash','password','session_secret','cookie','authorization','token','secret','phone','memo','note','comment','score','pre_score','post_score','not_completed_reason','status_reason']);
 function sanitizeAuditPayload(value:unknown):unknown {
