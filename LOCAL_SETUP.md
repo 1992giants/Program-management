@@ -90,6 +90,12 @@ npm run audit:scan -- --database "C:\OnmaeumProgramCare\data\onmaeum.sqlite"
 
 현재 감사로그의 `ip_address`는 `local` sentinel로 기록됩니다. 신뢰 가능한 reverse proxy가 도입되기 전에는 실제 네트워크 source IP를 증명하지 않으며, forensic-grade IP attribution으로 해석하면 안 됩니다.
 
+### 일반 담당자 초기 데이터 범위
+
+일반 담당자의 로그인·새로고침·업무 변경 응답은 관리자 스냅샷과 분리됩니다. 센터명 외 내부 설정 marker, 백업 정보, 잠긴 직원 수, 직원 목록, 확인서 목록, 중복 참가자 상세는 일반 담당자에게 전송하지 않습니다. 참가자와 신청 내역도 화면 운영에 필요한 명시적 컬럼만 조회합니다.
+
+이번 단계에서는 기존 참가자 수정 흐름을 보존하기 위해 연락처·성별·나이·회원 여부·메모와 신청 사유를 일반 담당자 응답에 유지합니다. 검사 점수, 만족도 응답, 일정, 출석 상세의 on-demand 조회 전환과 프로그램·차수·회기 컬럼의 추가 최소화는 Sprint 1B-2C-2 범위로 남아 있습니다.
+
 - 운영 DB를 UNC 공유경로에 두지 마세요. SQLite 파일은 서버 PC에서만 열고 직원 PC는 브라우저로 접속합니다.
 - 운영 서버는 `ONMAEUM_DB_PATH`가 없으면 시작되지 않습니다. 개발 서버는 이 값을 사용하지 않고 `ONMAEUM_DEV_DB_PATH` 또는 별도의 기본 `data/development.sqlite`를 사용합니다.
 - production 일반 실행은 기존 DB만 열며, 신규 DB 생성·기존 DB adoption·USR-ADMIN migration은 서로 다른 명시적 일회성 모드로 구분됩니다.
