@@ -51,7 +51,7 @@ function staffSnapshot(currentUser:SafeUser) {
     settings,
     databasePath:'로컬 데이터베이스',
     storageInfo:{architecture:'단일 서버 프로세스',journalMode:'DELETE'},
-    participants:rows(`SELECT p.id,p.name,p.gender,p.age,p.phone,p.member_status,p.note,COUNT(DISTINCT a.id) AS application_count,COUNT(DISTINCT CASE WHEN at.status IN ('참석','보강') THEN at.id END) AS attended_count FROM participants p LEFT JOIN applications a ON a.participant_id=p.id LEFT JOIN attendance at ON at.application_id=a.id GROUP BY p.id ORDER BY p.name,p.id`),
+    participants:rows(`SELECT p.id,p.name,p.gender,p.age,p.phone,p.member_status,COUNT(DISTINCT a.id) AS application_count,COUNT(DISTINCT CASE WHEN at.status IN ('참석','보강') THEN at.id END) AS attended_count FROM participants p LEFT JOIN applications a ON a.participant_id=p.id LEFT JOIN attendance at ON at.application_id=a.id GROUP BY p.id ORDER BY p.name,p.id`),
     duplicateGroups:[],
     programs:rows(`SELECT p.id,p.name,p.category,p.delivery_type,p.session_count,p.recurrence,p.location,p.manager,p.capacity,p.status,COUNT(DISTINCT r.id) AS run_count,COUNT(DISTINCT a.id) AS applicant_count FROM programs p LEFT JOIN program_runs r ON r.program_id=p.id LEFT JOIN applications a ON a.program_id=p.id GROUP BY p.id ORDER BY p.created_at DESC`),
     runs:rows(`SELECT r.id,r.program_id,r.round_number,r.label,r.start_date,r.status,r.closed_at,r.closed_by,p.name AS program_name,p.delivery_type,p.session_count,p.capacity,p.manager,COUNT(DISTINCT a.id) AS applicant_count FROM program_runs r JOIN programs p ON p.id=r.program_id LEFT JOIN applications a ON a.run_id=r.id GROUP BY r.id ORDER BY r.start_date DESC,r.round_number DESC`),
@@ -119,7 +119,7 @@ function snapshot(currentUser:SafeUser) {
 }
 
 async function handleGET(request:Request) {
-  try { const db=getDatabase(),user=getAuthenticatedUser(request,db);if(!user)return loginRequired();if(new URL(request.url).searchParams.get('resource')==='audit'){if(user.role!=='관리자'||user.must_change_pin)return Response.json({error:'관리자만 변경 이력을 조회할 수 있습니다.'},{status:403});return Response.json({auditLogs:db.prepare(`SELECT al.*,su.display_name AS actor_display_name FROM audit_logs al LEFT JOIN staff_users su ON su.id=al.actor ORDER BY al.id DESC LIMIT 300`).all()});}return Response.json(snapshot(user)); }
+  try { const db=getDatabase(),user=getAuthenticatedUser(request,db);if(!user)return loginRequired();const params=new URL(request.url).searchParams,resource=params.get('resource');if(resource==='participant'){if(user.must_change_pin)return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!['관리자','일반 담당자'].includes(user.role))return Response.json({error:'참가자 상세정보를 조회할 권한이 없습니다.'},{status:403});const requestedId=(params.get('id')||'').trim();if(!requestedId)return Response.json({error:'참가자 ID를 입력하세요.'},{status:400});const participant=db.prepare("SELECT id,name,phone,gender,age,member_status,COALESCE(note,'') AS note FROM participants WHERE id=?").get(requestedId);if(!participant)return Response.json({error:'참가자를 찾을 수 없습니다.'},{status:404});return Response.json({participant});}if(resource==='audit'){if(user.role!=='관리자'||user.must_change_pin)return Response.json({error:'관리자만 변경 이력을 조회할 수 있습니다.'},{status:403});return Response.json({auditLogs:db.prepare(`SELECT al.*,su.display_name AS actor_display_name FROM audit_logs al LEFT JOIN staff_users su ON su.id=al.actor ORDER BY al.id DESC LIMIT 300`).all()});}return Response.json(snapshot(user)); }
   catch (error) { return internalError(error); }
 }
 
