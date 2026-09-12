@@ -45,16 +45,44 @@ function validateBackup(filePath:string) {
   try { const integrity=candidate.prepare('PRAGMA integrity_check').get() as {integrity_check:string}; const tables=(candidate.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as {name:string}[]).map(row=>row.name); const required=['participants','programs','program_runs','sessions','applications','attendance','settings']; const missing=required.filter(name=>!tables.includes(name)); if(integrity.integrity_check!=='ok'||missing.length) throw new ActionError(`백업 점검 실패${missing.length?`: 누락 테이블 ${missing.join(', ')}`:''}`); return {ok:true,message:'무결성 점검 정상',tables:tables.length}; } finally { candidate.close(); }
 }
 
-function snapshot(currentUser?:SafeUser) {
-  if(currentUser?.role==='출석 입력 전용')return attendanceOnlySnapshot(getDatabase(),currentUser);
+function staffSnapshot(currentUser:SafeUser) {
+  const settings=Object.fromEntries((rows(`SELECT key,value FROM settings WHERE key='center_name'`) as {key:string;value:string}[]).map(item=>[item.key,item.value]));
+  return {
+    settings,
+    databasePath:'로컬 데이터베이스',
+    storageInfo:{architecture:'단일 서버 프로세스',journalMode:'DELETE'},
+    participants:rows(`SELECT p.id,p.name,p.gender,p.age,p.phone,p.member_status,p.note,COUNT(DISTINCT a.id) AS application_count,COUNT(DISTINCT CASE WHEN at.status IN ('참석','보강') THEN at.id END) AS attended_count FROM participants p LEFT JOIN applications a ON a.participant_id=p.id LEFT JOIN attendance at ON at.application_id=a.id GROUP BY p.id ORDER BY p.name,p.id`),
+    duplicateGroups:[],
+    programs:rows(`SELECT p.id,p.name,p.category,p.delivery_type,p.session_count,p.recurrence,p.location,p.manager,p.capacity,p.status,COUNT(DISTINCT r.id) AS run_count,COUNT(DISTINCT a.id) AS applicant_count FROM programs p LEFT JOIN program_runs r ON r.program_id=p.id LEFT JOIN applications a ON a.program_id=p.id GROUP BY p.id ORDER BY p.created_at DESC`),
+    runs:rows(`SELECT r.id,r.program_id,r.round_number,r.label,r.start_date,r.status,r.closed_at,r.closed_by,p.name AS program_name,p.delivery_type,p.session_count,p.capacity,p.manager,COUNT(DISTINCT a.id) AS applicant_count FROM program_runs r JOIN programs p ON p.id=r.program_id LEFT JOIN applications a ON a.run_id=r.id GROUP BY r.id ORDER BY r.start_date DESC,r.round_number DESC`),
+    sessions:rows(`SELECT s.id,s.run_id,s.session_number,s.session_date,s.session_time,s.location,s.attendance_status,s.attendance_closed_at,s.attendance_closed_by,s.reopen_reason,r.program_id,r.label AS run_label,p.name AS program_name FROM sessions s JOIN program_runs r ON r.id=s.run_id JOIN programs p ON p.id=r.program_id ORDER BY s.session_date DESC,s.session_time`),
+    applications:rows(`SELECT a.id,a.participant_id,a.program_id,a.run_id,a.applied_at,a.status,a.queue_number,a.status_reason,p.name AS participant_name,p.phone,p.gender,p.age,p.member_status,pr.name AS program_name,COALESCE(r.label,'차수 미배정') AS run_label,pr.delivery_type,pr.session_count,r.start_date FROM applications a JOIN participants p ON p.id=a.participant_id JOIN programs pr ON pr.id=a.program_id LEFT JOIN program_runs r ON r.id=a.run_id ORDER BY a.applied_at DESC,a.id DESC`),
+    attendance:rows(`SELECT at.id,at.application_id,at.session_id,at.status,at.note,at.contacted_at,at.makeup_for_session_id,a.participant_id,a.run_id,p.name AS participant_name,s.session_number,s.session_date,s.session_time,pr.name AS program_name,r.label AS run_label FROM attendance at JOIN applications a ON a.id=at.application_id JOIN participants p ON p.id=a.participant_id JOIN sessions s ON s.id=at.session_id JOIN program_runs r ON r.id=a.run_id JOIN programs pr ON pr.id=a.program_id ORDER BY s.session_date DESC`),
+    certificates:[],backupFiles:[],users:[],currentUser,
+    assessmentCatalog:rows(`SELECT id,name,min_score,max_score,active,created_at,version,description FROM assessment_catalog ORDER BY active DESC,name`),
+    programAssessments:rows(`SELECT pa.program_id,pa.assessment_id,pa.sort_order,a.name,a.min_score,a.max_score,a.active FROM program_assessments pa JOIN assessment_catalog a ON a.id=pa.assessment_id ORDER BY pa.program_id,pa.sort_order,a.name`),
+    assessmentScores:rows(`SELECT sc.id,sc.application_id,sc.assessment_id,sc.pre_score,sc.post_score,sc.note,sc.updated_at,sc.pre_date,sc.post_date,sc.not_completed_reason,sc.assessor,a.name,a.min_score,a.max_score FROM assessment_scores sc JOIN assessment_catalog a ON a.id=sc.assessment_id ORDER BY sc.updated_at DESC`),
+    satisfactionSurveys:rows(`SELECT id,application_id,score,comment,updated_at,survey_version,anonymous FROM satisfaction_surveys ORDER BY updated_at DESC`),
+    scheduleEvents:rows(`SELECT e.id,e.event_type,e.color,e.participant_id,e.title,e.event_date,e.all_day,e.start_time,e.end_time,e.recurrence,e.delivery_mode,e.created_at,p.name AS participant_name FROM schedule_events e JOIN participants p ON p.id=e.participant_id ORDER BY e.event_date DESC,e.all_day DESC,e.start_time`),
+    operationalMetrics:{
+      unassignedApplications:(rows(`SELECT COUNT(*) AS count FROM applications WHERE run_id IS NULL AND status NOT IN ('취소','중도탈락','참가완료')`)[0] as {count:number}).count,
+      reviewApplications:(rows(`SELECT COUNT(*) AS count FROM applications WHERE status IN ('신청','선정검토')`)[0] as {count:number}).count,
+      openAttendanceSessions:(rows(`SELECT COUNT(*) AS count FROM sessions WHERE session_date<=date('now','localtime') AND attendance_status!='마감'`)[0] as {count:number}).count,
+      missingPostAssessments:(rows(`SELECT COUNT(*) AS count FROM assessment_scores WHERE pre_score IS NOT NULL AND post_score IS NULL AND not_completed_reason=''`)[0] as {count:number}).count,
+      missingSatisfaction:(rows(`SELECT COUNT(*) AS count FROM applications a WHERE a.status='참가완료' AND NOT EXISTS(SELECT 1 FROM satisfaction_surveys s WHERE s.application_id=a.id)`)[0] as {count:number}).count,
+    },
+  };
+}
+
+function adminSnapshot(currentUser:SafeUser) {
   const settings = Object.fromEntries((rows('SELECT key, value FROM settings') as {key:string;value:string}[]).map(item=>[item.key,item.value]));
   const participants=rows(`SELECT p.*, COUNT(DISTINCT a.id) AS application_count, COUNT(DISTINCT CASE WHEN at.status IN ('참석','보강') THEN at.id END) AS attended_count, MAX(s.session_date) AS last_visit FROM participants p LEFT JOIN applications a ON a.participant_id=p.id LEFT JOIN attendance at ON at.application_id=a.id LEFT JOIN sessions s ON s.id=at.session_id GROUP BY p.id ORDER BY p.created_at DESC`) as Record<string,unknown>[];
   const duplicateMap=new Map<string,Record<string,unknown>[]>();
   for(const participant of participants){const key=`${String(participant.name).trim()}|${String(participant.phone).replace(/\D/g,'')}`;if(!String(participant.phone).replace(/\D/g,''))continue;duplicateMap.set(key,[...(duplicateMap.get(key)||[]),participant]);}
   return {
     settings,
-    databasePath: currentUser?.role==='관리자'?getDatabasePath():'로컬 데이터베이스',
-    storageInfo: currentUser?.role==='관리자'?getStorageInfo():{architecture:'단일 서버 프로세스',journalMode:'DELETE'},
+    databasePath:getDatabasePath(),
+    storageInfo:getStorageInfo(),
     participants,
     duplicateGroups:[...duplicateMap.values()].filter(group=>group.length>1),
     programs: rows(`SELECT p.*, COUNT(DISTINCT r.id) AS run_count, COUNT(DISTINCT a.id) AS applicant_count FROM programs p LEFT JOIN program_runs r ON r.program_id=p.id LEFT JOIN applications a ON a.program_id=p.id GROUP BY p.id ORDER BY p.created_at DESC`),
@@ -63,9 +91,9 @@ function snapshot(currentUser?:SafeUser) {
     applications: rows(`SELECT a.*, p.name AS participant_name, p.gender, p.age, p.phone, p.member_status, COALESCE(r.label,'차수 미배정') AS run_label, r.round_number, pr.name AS program_name, pr.delivery_type, pr.session_count, r.start_date FROM applications a JOIN participants p ON p.id=a.participant_id JOIN programs pr ON pr.id=a.program_id LEFT JOIN program_runs r ON r.id=a.run_id ORDER BY a.applied_at DESC, a.id DESC`),
     attendance: rows(`SELECT at.*, a.participant_id, a.run_id, p.name AS participant_name, s.session_number, s.session_date, s.session_time, pr.name AS program_name, r.label AS run_label FROM attendance at JOIN applications a ON a.id=at.application_id JOIN participants p ON p.id=a.participant_id JOIN sessions s ON s.id=at.session_id JOIN program_runs r ON r.id=a.run_id JOIN programs pr ON pr.id=a.program_id ORDER BY s.session_date DESC`),
     certificates: rows(`SELECT c.*, p.name AS participant_name FROM certificates c JOIN participants p ON p.id=c.participant_id ORDER BY c.issued_at DESC`),
-    backupFiles: currentUser?.role==='관리자'?backupFiles():[],
-    users: currentUser?.role==='관리자'?rows(`SELECT id,username,display_name,role,active,created_at,failed_attempts,locked_until,last_login_at,pin_changed_at,must_change_pin FROM staff_users ORDER BY active DESC, display_name`):[],
-    currentUser: currentUser||null,
+    backupFiles:backupFiles(),
+    users:rows(`SELECT id,username,display_name,role,active,created_at,failed_attempts,locked_until,last_login_at,pin_changed_at,must_change_pin FROM staff_users ORDER BY active DESC, display_name`),
+    currentUser,
     assessmentCatalog: rows(`SELECT * FROM assessment_catalog ORDER BY active DESC, name`),
     programAssessments: rows(`SELECT pa.*,a.name,a.min_score,a.max_score,a.active FROM program_assessments pa JOIN assessment_catalog a ON a.id=pa.assessment_id ORDER BY pa.program_id,pa.sort_order,a.name`),
     assessmentScores: rows(`SELECT sc.*,a.name,a.min_score,a.max_score FROM assessment_scores sc JOIN assessment_catalog a ON a.id=sc.assessment_id ORDER BY sc.updated_at DESC`),
@@ -81,6 +109,13 @@ function snapshot(currentUser?:SafeUser) {
       latestBackup:backupFiles()[0]||null,
     },
   };
+}
+
+function snapshot(currentUser:SafeUser) {
+  if(currentUser.role==='관리자')return adminSnapshot(currentUser);
+  if(currentUser.role==='일반 담당자')return staffSnapshot(currentUser);
+  if(currentUser.role==='출석 입력 전용')return attendanceOnlySnapshot(getDatabase(),currentUser);
+  throw new ActionError('허용되지 않은 사용자 역할입니다.');
 }
 
 async function handleGET(request:Request) {
