@@ -3,6 +3,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createRun, getBackupDirectory, getDatabase, getDatabasePath, getStorageInfo, hashPin, verifyPin } from '../../../db/index.ts';
 import { attendanceOnlySnapshot, canPerformAction, createAuthSession, expiredSessionCookie, getAuthenticatedUser, invalidateAuthSession, sessionCookie, validateMutationRequest, type SafeUser } from '../../../lib/security.ts';
+import { inclusiveCalendarDays, isCanonicalCalendarDate } from '../../../lib/schedule-state.ts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -97,7 +98,7 @@ function staffSnapshot(currentUser:SafeUser) {
     programAssessments:rows(`SELECT pa.program_id,pa.assessment_id,pa.sort_order,a.name,a.min_score,a.max_score,a.active FROM program_assessments pa JOIN assessment_catalog a ON a.id=pa.assessment_id ORDER BY pa.program_id,pa.sort_order,a.name`),
     assessmentScores:[],
     satisfactionSurveys:[],
-    scheduleEvents:rows(`SELECT e.id,e.event_type,e.color,e.participant_id,e.title,e.event_date,e.all_day,e.start_time,e.end_time,e.recurrence,e.delivery_mode,e.created_at,p.name AS participant_name FROM schedule_events e JOIN participants p ON p.id=e.participant_id ORDER BY e.event_date DESC,e.all_day DESC,e.start_time`),
+    scheduleEvents:[],
     operationalMetrics:{
       unassignedApplications:(rows(`SELECT COUNT(*) AS count FROM applications WHERE run_id IS NULL AND status NOT IN ('취소','중도탈락','참가완료')`)[0] as {count:number}).count,
       reviewApplications:(rows(`SELECT COUNT(*) AS count FROM applications WHERE status IN ('신청','선정검토')`)[0] as {count:number}).count,
@@ -183,6 +184,19 @@ async function handleGET(request:Request) {
       const attendance=db.prepare(`SELECT at.id,at.application_id,at.session_id,at.status,at.note,at.contacted_at,at.makeup_for_session_id FROM attendance at JOIN applications a ON a.id=at.application_id JOIN program_runs r ON r.id=a.run_id AND r.program_id=a.program_id WHERE at.session_id=? AND a.run_id=? AND a.program_id=? AND r.id=? AND r.program_id=? AND a.status NOT IN ('취소','중도탈락') ORDER BY at.application_id`).all(scope.sessionId,scope.runId,scope.programId,scope.runId,scope.programId);
       return Response.json({sessionId:scope.sessionId,runId:scope.runId,attendance});
     }
+    if(resource==='schedule'){
+      if(user.must_change_pin)return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});
+      if(!['관리자','일반 담당자'].includes(user.role))return Response.json({error:'일정 정보를 조회할 권한이 없습니다.'},{status:403});
+      const fromValues=params.getAll('from'),toValues=params.getAll('to');
+      if(fromValues.length!==1||toValues.length!==1)throw new ActionError('일정 조회 시작일과 종료일을 하나씩 지정하세요.');
+      const from=fromValues[0].trim(),to=toValues[0].trim();
+      if(!isCanonicalCalendarDate(from)||!isCanonicalCalendarDate(to))throw new ActionError('올바른 일정 조회 날짜를 입력하세요.');
+      const rangeDays=inclusiveCalendarDays(from,to);
+      if(rangeDays<1)throw new ActionError('일정 조회 종료일은 시작일보다 빠를 수 없습니다.');
+      if(rangeDays>42)throw new ActionError('일정 조회 범위는 최대 42일까지 지정할 수 있습니다.');
+      const scheduleEvents=db.prepare(`SELECT id,event_type,color,participant_id,title,event_date,all_day,start_time,delivery_mode FROM schedule_events WHERE event_date>=? AND event_date<=? ORDER BY event_date,all_day DESC,start_time,id`).all(from,to);
+      return Response.json({from,to,scheduleEvents});
+    }
     if(resource==='participant'){if(user.must_change_pin)return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!['관리자','일반 담당자'].includes(user.role))return Response.json({error:'참가자 상세정보를 조회할 권한이 없습니다.'},{status:403});const requestedId=(params.get('id')||'').trim();if(!requestedId)return Response.json({error:'참가자 ID를 입력하세요.'},{status:400});const participant=db.prepare("SELECT id,name,phone,gender,age,member_status,COALESCE(note,'') AS note FROM participants WHERE id=?").get(requestedId);if(!participant)return Response.json({error:'참가자를 찾을 수 없습니다.'},{status:404});return Response.json({participant});}
     if(resource==='audit'){if(user.role!=='관리자'||user.must_change_pin)return Response.json({error:'관리자만 변경 이력을 조회할 수 있습니다.'},{status:403});return Response.json({auditLogs:db.prepare(`SELECT al.*,su.display_name AS actor_display_name FROM audit_logs al LEFT JOIN staff_users su ON su.id=al.actor ORDER BY al.id DESC LIMIT 300`).all()});}
     return Response.json(snapshot(user));
@@ -258,11 +272,14 @@ async function handlePOST(request:Request) {
       const after={session_date:text(body.sessionDate),session_time:text(body.sessionTime),location:text(body.location)};logChange(db,'일정 수정','회기',before.id,{session_date:before.session_date,session_time:before.session_time,location:before.location},after,'프로그램 회기 일정 수정',user.id,'',requestIp(request));
     } else if (body.action === 'createScheduleEvent') {
       const participantId=text(body.participantId),title=text(body.title).trim(),eventDate=text(body.eventDate),eventType=text(body.eventType)||'상담',color=text(body.color)||'green',allDay=body.allDay?1:0,startTime=allDay?'':text(body.startTime),endTime=allDay?'':text(body.endTime),recurrence=text(body.recurrence)||'1회',deliveryMode=text(body.deliveryMode)||'대면';
-      if(!participantId||!title||!/^\d{4}-\d{2}-\d{2}$/.test(eventDate))throw new ActionError('참가자, 일정 제목과 날짜를 입력하세요.');
+      if(!participantId||!title||!isCanonicalCalendarDate(eventDate))throw new ActionError('참가자, 일정 제목과 올바른 날짜를 입력하세요.');
+      if(typeof body.allDay!=='boolean')throw new ActionError('하루 종일 여부를 올바르게 입력하세요.');
       if(!db.prepare('SELECT id FROM participants WHERE id=?').get(participantId))throw new ActionError('참가자를 찾을 수 없습니다.');
-      if(!allDay&&(!startTime||!endTime||endTime<=startTime))throw new ActionError('종료시간은 시작시간보다 늦어야 합니다.');
+      if(!allDay&&(!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(endTime)||endTime<=startTime))throw new ActionError('올바른 시작·종료시간을 입력하고 종료시간을 시작시간보다 늦게 설정하세요.');
       if(!['상담','프로그램','기타'].includes(eventType))throw new ActionError('올바른 프로그램 종류를 선택하세요.');
       if(!['green','orange','blue','purple','gray'].includes(color))throw new ActionError('올바른 일정 색상을 선택하세요.');
+      if(!['1회','매주','격주','매월'].includes(recurrence))throw new ActionError('올바른 프로그램 주기를 선택하세요.');
+      if(!['대면','비대면','전화','가정방문'].includes(deliveryMode))throw new ActionError('올바른 프로그램 방식을 선택하세요.');
       const id=`EVT-${String(Date.now()).slice(-10)}`,createdAt=new Date().toISOString();
       db.prepare('INSERT INTO schedule_events (id,event_type,color,participant_id,title,event_date,all_day,start_time,end_time,recurrence,delivery_mode,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(id,eventType,color,participantId,title,eventDate,allDay,startTime,endTime,recurrence,deliveryMode,createdAt);
       logChange(db,'일정 등록','일정',id,null,{event_type:eventType,event_date:eventDate,all_day:Boolean(allDay),start_time:startTime,end_time:endTime,recurrence,delivery_mode:deliveryMode,participant_id:participantId,title_present:Boolean(title)},'일정 등록',user.id,'',requestIp(request));
