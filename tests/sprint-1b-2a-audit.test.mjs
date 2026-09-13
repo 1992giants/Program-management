@@ -36,6 +36,7 @@ test('감사로그는 관리자 전용이며 민감 원문과 credential을 복�
     db.prepare('INSERT INTO program_runs (id,program_id,round_number,label,start_date,status) VALUES (?,?,?,?,?,?)').run('RUN-AUDIT','PRG-AUDIT',1,'1차',today,'진행 중');
     db.prepare('INSERT INTO sessions (id,run_id,session_number,session_date,session_time,location) VALUES (?,?,?,?,?,?)').run('SESSION-AUDIT','RUN-AUDIT',1,today,'10:00','프로그램실');
     db.prepare('INSERT INTO applications (id,participant_id,program_id,run_id,applied_at,status,queue_number) VALUES (?,?,?,?,?,?,?)').run(101,'P-AUDIT','PRG-AUDIT','RUN-AUDIT',today,'참가중',1);
+    db.prepare('INSERT INTO program_assessments (program_id,assessment_id,sort_order) VALUES (?,?,0)').run('PRG-AUDIT','ASM-PHQ9');
 
     const post=(body,cookie='')=>POST(new Request(origin+'/api/data',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{})},body:JSON.stringify(body)}));
     const get=(cookie='',resource='')=>GET(new Request(origin+'/api/data'+resource,{headers:{...(cookie?{Cookie:cookie}:{})}}));
@@ -78,7 +79,7 @@ test('감사로그는 관리자 전용이며 민감 원문과 credential을 복�
     assert.deepEqual(JSON.parse(participantLog.after_json).changed_fields,['phone','note']);
 
     const assessmentNote='검사 관련 극비 메모',assessmentReason='검사 미실시 민감 사유';
-    const assessmentResponse=await post({action:'saveAssessmentScore',applicationId:101,assessmentId:'ASM-PHQ9',preScore:27,postScore:'',note:assessmentNote,preDate:today,postDate:'',notCompletedReason:assessmentReason},staff.cookie);
+    const assessmentResponse=await post({action:'saveAssessmentScore',applicationId:101,assessmentId:'ASM-PHQ9',preScore:27,postScore:'',note:assessmentNote,preDate:today,postDate:'',notCompletedReason:assessmentReason,programId:'PRG-AUDIT',runId:'RUN-AUDIT'},staff.cookie);
     assert.equal(assessmentResponse.status,200);
     const assessmentLog=auditRow('검사 점수','성과검사'),assessmentText=auditText(assessmentLog),assessmentPayload=JSON.parse(assessmentLog.after_json);
     assert.equal(assessmentText.includes(assessmentNote),false);
@@ -89,7 +90,7 @@ test('감사로그는 관리자 전용이며 민감 원문과 credential을 복�
     assert.equal(assessmentPayload.reason_present,true);
 
     const satisfactionComment='만족도 극비 자유 의견';
-    assert.equal((await post({action:'saveSatisfaction',applicationId:101,score:4,comment:satisfactionComment,surveyVersion:'1.0',anonymous:false},staff.cookie)).status,200);
+    assert.equal((await post({action:'saveSatisfaction',applicationId:101,score:4,comment:satisfactionComment,surveyVersion:'1.0',anonymous:false,programId:'PRG-AUDIT',runId:'RUN-AUDIT'},staff.cookie)).status,200);
     const satisfactionLog=auditRow('만족도 입력','만족도'),satisfactionText=auditText(satisfactionLog),satisfactionPayload=JSON.parse(satisfactionLog.after_json);
     assert.equal(satisfactionText.includes(satisfactionComment),false);
     assert.equal(satisfactionText.includes('"score":4'),false);
