@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { isScheduleDataReady, isScheduleResponseCurrent, visibleScheduleDateKeys, type ScheduleRange } from '../../lib/schedule-state';
 
-type ParticipantOption = { id:string; name:string; phone:string };
+type ParticipantOption = { id:string; name:string };
 type CalendarSessionRecord = {
   id:string;
   program_name:string;
@@ -132,7 +132,7 @@ export function ScheduleCreateDrawer({participants,selectedDate,onClose,onCreate
         <label className="schedule-field-label">색상 선택</label>
         <div className="schedule-color-options">{COLORS.map(item=><button key={item.value} className={`${item.value} ${color===item.value?'active':''}`} onClick={()=>setColor(item.value)} aria-label={`${item.label} 선택`}><span/></button>)}</div>
       </section>
-      <label className="schedule-form-field"><span>참가자 선택 <b>*</b></span><select value={participantId} onChange={event=>setParticipantId(event.target.value)}><option value="">참가자를 선택하세요</option>{participants.map(participant=><option key={participant.id} value={participant.id}>{participant.name} · {participant.phone}</option>)}</select></label>
+      <label className="schedule-form-field"><span>참가자 선택 <b>*</b></span><select value={participantId} onChange={event=>setParticipantId(event.target.value)}><option value="">참가자를 선택하세요</option>{participants.map(participant=><option key={participant.id} value={participant.id}>{participant.name} · {participant.id}</option>)}</select></label>
       <label className="schedule-form-field"><span>일정 제목 <b>*</b></span><input value={title} onChange={event=>setTitle(event.target.value)} placeholder="예: 김민준 초기상담"/></label>
       <div className="schedule-divider"/>
       <label className="schedule-form-field"><span>날짜 <b>*</b></span><input type="date" value={eventDate} onChange={event=>setEventDate(event.target.value)}/></label>
