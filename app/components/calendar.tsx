@@ -1,6 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { isScheduleDataReady, isScheduleResponseCurrent, visibleScheduleDateKeys, type ScheduleRange } from '../../lib/schedule-state';
 
 type ParticipantOption = { id:string; name:string; phone:string };
 type CalendarSessionRecord = {
@@ -17,14 +18,15 @@ export type CalendarEventRecord = {
   event_type:string;
   color:string;
   participant_id:string;
-  participant_name:string;
+  participant_name?:string;
   title:string;
   event_date:string;
   all_day:number;
   start_time:string;
-  end_time:string;
-  recurrence:string;
+  end_time?:string;
+  recurrence?:string;
   delivery_mode:string;
+  created_at?:string;
 };
 export type ScheduleCreateInput = {
   eventType:string;
@@ -106,18 +108,10 @@ export function CalendarCell({date,currentMonth,selected,items,holiday,onSelect}
   </div>;
 }
 
-export function MonthlyCalendar({anchor,selectedDate,view,itemsByDate,onSelect}:{anchor:Date;selectedDate:string;view:'month'|'week';itemsByDate:Map<string,CalendarItem[]>;onSelect:(date:string)=>void}){
-  const dates=useMemo(()=>{
-    if(view==='week'){
-      const selected=dateFromKey(selectedDate),start=new Date(selected);start.setDate(selected.getDate()-selected.getDay());
-      return Array.from({length:7},(_,index)=>{const date=new Date(start);date.setDate(start.getDate()+index);return date});
-    }
-    const first=new Date(anchor.getFullYear(),anchor.getMonth(),1),start=new Date(first);start.setDate(1-first.getDay());
-    return Array.from({length:42},(_,index)=>{const date=new Date(start);date.setDate(start.getDate()+index);return date});
-  },[anchor,selectedDate,view]);
+export function MonthlyCalendar({anchor,selectedDate,view,dateKeys,itemsByDate,onSelect}:{anchor:Date;selectedDate:string;view:'month'|'week';dateKeys:string[];itemsByDate:Map<string,CalendarItem[]>;onSelect:(date:string)=>void}){
   return <section className={`monthly-calendar ${view==='week'?'weekly':''}`}>
     <div className="monthly-calendar-weekdays">{WEEKDAYS.map((weekday,index)=><b className={index===0?'sunday':index===6?'saturday':''} key={weekday}>{weekday}</b>)}</div>
-    <div className="monthly-calendar-grid">{dates.map(date=>{const key=dateKey(date);return <CalendarCell key={key} date={date} currentMonth={anchor.getMonth()} selected={key===selectedDate} items={itemsByDate.get(key)||[]} holiday={HOLIDAYS[key]} onSelect={onSelect}/>})}</div>
+    <div className="monthly-calendar-grid">{dateKeys.map(key=><CalendarCell key={key} date={dateFromKey(key)} currentMonth={anchor.getMonth()} selected={key===selectedDate} items={itemsByDate.get(key)||[]} holiday={HOLIDAYS[key]} onSelect={onSelect}/>)}</div>
   </section>;
 }
 
@@ -155,23 +149,61 @@ export function ScheduleCreateDrawer({participants,selectedDate,onClose,onCreate
   </aside>;
 }
 
-export default function ScheduleCalendar({participants,sessions,scheduleEvents,canEdit=true,onCreate}:{participants:ParticipantOption[];sessions:CalendarSessionRecord[];scheduleEvents:CalendarEventRecord[];canEdit?:boolean;onCreate:(input:ScheduleCreateInput)=>Promise<void>}){
+type ScopedSchedule={from:string;to:string;scheduleEvents:CalendarEventRecord[]};
+
+export default function ScheduleCalendar({participants,sessions,scheduleEvents,isStaff=false,canEdit=true,onSessionExpired,onCreate}:{participants:ParticipantOption[];sessions:CalendarSessionRecord[];scheduleEvents:CalendarEventRecord[];isStaff?:boolean;canEdit?:boolean;onSessionExpired:()=>void;onCreate:(input:ScheduleCreateInput)=>Promise<void>}){
   const initial=todayKey(),[selectedDate,setSelectedDate]=useState(initial),[anchor,setAnchor]=useState(()=>dateFromKey(initial)),[view,setView]=useState<'month'|'week'>('month'),[drawerOpen,setDrawerOpen]=useState(canEdit);
+  const [scopedSchedule,setScopedSchedule]=useState<ScopedSchedule|null>(null),[scheduleLoading,setScheduleLoading]=useState(false),[scheduleFresh,setScheduleFresh]=useState(false),[scheduleError,setScheduleError]=useState('');
+  const anchorKey=dateKey(anchor),visibleDateKeys=useMemo(()=>visibleScheduleDateKeys(anchorKey,selectedDate,view),[anchorKey,selectedDate,view]);
+  const visibleFrom=visibleDateKeys[0]||'',visibleTo=visibleDateKeys.at(-1)||'',visibleRange=useMemo<ScheduleRange>(()=>({from:visibleFrom,to:visibleTo}),[visibleFrom,visibleTo]);
+  const scheduleAbort=useRef<AbortController|null>(null),currentRange=useRef<ScheduleRange>(visibleRange),sessionExpiredRef=useRef(onSessionExpired);
+  useEffect(()=>{currentRange.current=visibleRange},[visibleRange]);
+  useEffect(()=>{sessionExpiredRef.current=onSessionExpired},[onSessionExpired]);
+  const loadScheduleRange=useCallback(async(range:ScheduleRange,preserveCurrent:boolean,afterCreate=false)=>{
+    scheduleAbort.current?.abort();
+    const controller=new AbortController();scheduleAbort.current=controller;
+    if(!preserveCurrent)setScopedSchedule(null);
+    setScheduleLoading(true);setScheduleFresh(false);setScheduleError('');
+    try{
+      const response=await fetch(`/api/data?resource=schedule&from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,{credentials:'same-origin',signal:controller.signal});
+      const result=await response.json() as ScopedSchedule&{error?:string;loginRequired?:boolean};
+      if(!response.ok){if(result.loginRequired||response.status===401)sessionExpiredRef.current();throw new Error(result.error||'일정을 불러오지 못했습니다.');}
+      if(controller.signal.aborted||scheduleAbort.current!==controller||!isScheduleResponseCurrent(currentRange.current,range,{from:result.from,to:result.to}))return false;
+      setScopedSchedule(result);setScheduleFresh(true);return true;
+    }catch(error){
+      if(controller.signal.aborted||(error instanceof Error&&error.name==='AbortError'))return false;
+      if(scheduleAbort.current===controller){const message=error instanceof Error?error.message:'일정을 불러오지 못했습니다.';setScheduleError(afterCreate?`일정은 저장되었으나 달력을 새로고침하지 못했습니다. ${message}`:message)}
+      return false;
+    }finally{if(scheduleAbort.current===controller)setScheduleLoading(false)}
+  },[]);
+  useEffect(()=>{
+    if(!isStaff){scheduleAbort.current?.abort();return;}
+    if(!visibleRange.from||!visibleRange.to)return;
+    // The effect starts the range request; state changes inside the callback expose its loading state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadScheduleRange(visibleRange,false);
+    return ()=>scheduleAbort.current?.abort();
+  },[isStaff,visibleRange,loadScheduleRange]);
+  const scopeMatches=Boolean(scopedSchedule&&scopedSchedule.from===visibleRange.from&&scopedSchedule.to===visibleRange.to),scheduleReady=isScheduleDataReady(isStaff,scopeMatches,scheduleLoading,scheduleFresh,scheduleError);
+  const visibleEvents=useMemo(()=>isStaff?(scheduleReady?scopedSchedule?.scheduleEvents||[]:[]):scheduleEvents,[isStaff,scheduleReady,scopedSchedule,scheduleEvents]);
   const itemsByDate=useMemo(()=>{
-    const map=new Map<string,CalendarItem[]>(),add=(key:string,item:CalendarItem)=>map.set(key,[...(map.get(key)||[]),item]);
+    const map=new Map<string,CalendarItem[]>(),participantNames=new Map(participants.map(participant=>[participant.id,participant.name])),add=(key:string,item:CalendarItem)=>map.set(key,[...(map.get(key)||[]),item]);
     sessions.forEach(session=>add(session.session_date,{id:session.id,title:session.program_name,time:session.session_time.slice(0,5),color:'blue',meta:`${session.run_label} · ${session.session_number}회기 · ${session.location}`,kind:'session'}));
-    scheduleEvents.forEach(event=>add(event.event_date,{id:event.id,title:event.title,time:event.all_day?'':event.start_time.slice(0,5),color:event.color,meta:`${event.participant_name} · ${event.event_type} · ${event.delivery_mode}`,kind:'custom'}));
+    visibleEvents.forEach(event=>add(event.event_date,{id:event.id,title:event.title,time:event.all_day?'':event.start_time.slice(0,5),color:event.color,meta:`${participantNames.get(event.participant_id)||event.participant_name||'참가자 정보 없음'} · ${event.event_type} · ${event.delivery_mode}`,kind:'custom'}));
     for(const list of map.values())list.sort((a,b)=>(a.time||'00:00').localeCompare(b.time||'00:00'));
     return map;
-  },[sessions,scheduleEvents]);
+  },[participants,sessions,visibleEvents]);
   const selectDate=(value:string)=>{setSelectedDate(value);setAnchor(dateFromKey(value))};
   const move=(amount:number)=>{const next=new Date(anchor);if(view==='month')next.setMonth(next.getMonth()+amount,1);else next.setDate(next.getDate()+amount*7);setAnchor(next);if(view==='week')setSelectedDate(dateKey(next))};
   const goToday=()=>{const value=todayKey();setSelectedDate(value);setAnchor(dateFromKey(value))};
+  const createSchedule=async(input:ScheduleCreateInput)=>{await onCreate(input);if(isStaff)await loadScheduleRange(currentRange.current,true,true)};
   return <div className={`calendar-workspace ${drawerOpen?'with-drawer':''}`}>
     <div className="calendar-main-panel">
       <CalendarHeader anchor={anchor} view={view} onMove={move} onToday={goToday} onView={setView} onOpenDrawer={()=>setDrawerOpen(true)} drawerOpen={drawerOpen}/>
-      <MonthlyCalendar anchor={anchor} selectedDate={selectedDate} view={view} itemsByDate={itemsByDate} onSelect={selectDate}/>
+      {isStaff&&scheduleLoading&&<div className="import-guide"><b>일정 불러오는 중</b><span>{visibleRange.from} ~ {visibleRange.to} 일정을 확인하고 있습니다.</span></div>}
+      {isStaff&&scheduleError&&<div className="import-guide"><b>달력이 최신 상태가 아닙니다.</b><span>{scheduleError}</span><button onClick={()=>void loadScheduleRange(currentRange.current,true)}>다시 불러오기</button></div>}
+      <MonthlyCalendar anchor={anchor} selectedDate={selectedDate} view={view} dateKeys={visibleDateKeys} itemsByDate={itemsByDate} onSelect={selectDate}/>
     </div>
-    {drawerOpen&&canEdit&&<ScheduleCreateDrawer key={selectedDate} participants={participants} selectedDate={selectedDate} onClose={()=>setDrawerOpen(false)} onCreate={onCreate}/>}
+    {drawerOpen&&canEdit&&<ScheduleCreateDrawer key={selectedDate} participants={participants} selectedDate={selectedDate} onClose={()=>setDrawerOpen(false)} onCreate={createSchedule}/>}
   </div>;
 }
