@@ -56,13 +56,14 @@ test('일반 담당자의 참가자 메모는 초기 snapshot에서 제외되고
     assert.equal(JSON.stringify(detailBody).includes('DETAIL-B-SECRET-NOTE'),false);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_logs').get().count,auditBefore);
 
-    for(const [id,status] of [['',400],['*',404],['%',404],['P-DETAIL-A,P-DETAIL-B',404],['not-a-participant',404]]){
+    for(const [id,status] of [['',400],[' ',400],['*',400],['%',400],['_',400],['0',400],['-1',400],['1.5',400],['NaN',400],['P-DETAIL-A,P-DETAIL-B',400],['not-a-participant',400],['P-NOT-FOUND',404]]){
       const response=await get('/api/data?resource=participant&id='+encodeURIComponent(id),staff.cookie);
       assert.equal(response.status,status,id);
       const serialized=JSON.stringify(await response.json());
       assert.equal(serialized.includes('DETAIL-A-SECRET-NOTE'),false,id);
       assert.equal(serialized.includes('DETAIL-B-SECRET-NOTE'),false,id);
     }
+    assert.equal((await get('/api/data?resource=participant&id=P-DETAIL-A&id=P-DETAIL-B',staff.cookie)).status,400);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_logs').get().count,auditBefore);
 
     const unauthenticated=await get('/api/data?resource=participant&id=P-DETAIL-A');

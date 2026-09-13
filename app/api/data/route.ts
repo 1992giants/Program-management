@@ -86,12 +86,12 @@ function staffSnapshot(currentUser:SafeUser) {
     settings,
     databasePath:'로컬 데이터베이스',
     storageInfo:{architecture:'단일 서버 프로세스',journalMode:'DELETE'},
-    participants:rows(`SELECT p.id,p.name,p.gender,p.age,p.phone,p.member_status,COUNT(DISTINCT a.id) AS application_count,COUNT(DISTINCT CASE WHEN at.status IN ('참석','보강') THEN at.id END) AS attended_count FROM participants p LEFT JOIN applications a ON a.participant_id=p.id LEFT JOIN attendance at ON at.application_id=a.id GROUP BY p.id ORDER BY p.name,p.id`),
+    participants:rows(`SELECT p.id,p.name,p.gender,p.age,p.member_status,COUNT(DISTINCT a.id) AS application_count,COUNT(DISTINCT CASE WHEN at.status IN ('참석','보강') THEN at.id END) AS attended_count FROM participants p LEFT JOIN applications a ON a.participant_id=p.id LEFT JOIN attendance at ON at.application_id=a.id GROUP BY p.id ORDER BY p.name,p.id`),
     duplicateGroups:[],
     programs:rows(`SELECT p.id,p.name,p.category,p.delivery_type,p.session_count,p.recurrence,p.location,p.manager,p.capacity,p.status,COUNT(DISTINCT r.id) AS run_count,COUNT(DISTINCT a.id) AS applicant_count FROM programs p LEFT JOIN program_runs r ON r.program_id=p.id LEFT JOIN applications a ON a.program_id=p.id GROUP BY p.id ORDER BY p.created_at DESC`),
     runs:rows(`SELECT r.id,r.program_id,r.round_number,r.label,r.start_date,r.status,r.closed_at,r.closed_by,p.name AS program_name,p.delivery_type,p.session_count,p.capacity,p.manager,COUNT(DISTINCT a.id) AS applicant_count FROM program_runs r JOIN programs p ON p.id=r.program_id LEFT JOIN applications a ON a.run_id=r.id GROUP BY r.id ORDER BY r.start_date DESC,r.round_number DESC`),
     sessions:rows(`SELECT s.id,s.run_id,s.session_number,s.session_date,s.session_time,s.location,s.attendance_status,s.attendance_closed_at,s.attendance_closed_by,r.program_id,r.label AS run_label,p.name AS program_name FROM sessions s JOIN program_runs r ON r.id=s.run_id JOIN programs p ON p.id=r.program_id ORDER BY s.session_date DESC,s.session_time`),
-    applications:rows(`SELECT a.id,a.participant_id,a.program_id,a.run_id,a.applied_at,a.status,a.queue_number,CASE WHEN TRIM(COALESCE(a.status_reason,''))<>'' THEN 1 ELSE 0 END AS reason_present,p.name AS participant_name,p.phone,p.gender,p.age,p.member_status,pr.name AS program_name,COALESCE(r.label,'차수 미배정') AS run_label,pr.delivery_type,pr.session_count,r.start_date FROM applications a JOIN participants p ON p.id=a.participant_id JOIN programs pr ON pr.id=a.program_id LEFT JOIN program_runs r ON r.id=a.run_id ORDER BY a.applied_at DESC,a.id DESC`),
+    applications:rows(`SELECT a.id,a.participant_id,a.program_id,a.run_id,a.applied_at,a.status,a.queue_number,CASE WHEN TRIM(COALESCE(a.status_reason,''))<>'' THEN 1 ELSE 0 END AS reason_present,p.name AS participant_name,p.gender,p.age,p.member_status,pr.name AS program_name,COALESCE(r.label,'차수 미배정') AS run_label,pr.delivery_type,pr.session_count,r.start_date FROM applications a JOIN participants p ON p.id=a.participant_id JOIN programs pr ON pr.id=a.program_id LEFT JOIN program_runs r ON r.id=a.run_id ORDER BY a.applied_at DESC,a.id DESC`),
     attendance:rows(`SELECT at.id,at.application_id,at.session_id,at.status,a.participant_id,a.run_id,s.session_number,s.session_date,pr.name AS program_name,r.label AS run_label FROM attendance at JOIN applications a ON a.id=at.application_id JOIN sessions s ON s.id=at.session_id AND s.run_id=a.run_id JOIN program_runs r ON r.id=a.run_id AND r.program_id=a.program_id JOIN programs pr ON pr.id=a.program_id ORDER BY s.session_date DESC`),
     certificates:[],backupFiles:[],users:[],currentUser,
     assessmentCatalog:rows(`SELECT id,name,min_score,max_score,active,created_at,version,description FROM assessment_catalog ORDER BY active DESC,name`),
@@ -210,7 +210,17 @@ async function handleGET(request:Request) {
       if(!application)return Response.json({error:'신청 기록을 찾을 수 없습니다.'},{status:404});
       return Response.json({applicationId:application.id,statusReason:application.status_reason});
     }
-    if(resource==='participant'){if(user.must_change_pin)return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!['관리자','일반 담당자'].includes(user.role))return Response.json({error:'참가자 상세정보를 조회할 권한이 없습니다.'},{status:403});const requestedId=(params.get('id')||'').trim();if(!requestedId)return Response.json({error:'참가자 ID를 입력하세요.'},{status:400});const participant=db.prepare("SELECT id,name,phone,gender,age,member_status,COALESCE(note,'') AS note FROM participants WHERE id=?").get(requestedId);if(!participant)return Response.json({error:'참가자를 찾을 수 없습니다.'},{status:404});return Response.json({participant});}
+    if(resource==='participant'){
+      if(user.must_change_pin)return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});
+      if(!['관리자','일반 담당자'].includes(user.role))return Response.json({error:'참가자 상세정보를 조회할 권한이 없습니다.'},{status:403});
+      const idValues=params.getAll('id');
+      if(idValues.length!==1)throw new ActionError('참가자 ID를 하나만 지정하세요.');
+      const requestedId=idValues[0].trim();
+      if(requestedId.length>64||!/^P-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/.test(requestedId))throw new ActionError('올바른 참가자 ID를 입력하세요.');
+      const participant=db.prepare("SELECT id,name,phone,gender,age,member_status,COALESCE(note,'') AS note FROM participants WHERE id=?").get(requestedId);
+      if(!participant)return Response.json({error:'참가자를 찾을 수 없습니다.'},{status:404});
+      return Response.json({participant});
+    }
     if(resource==='audit'){if(user.role!=='관리자'||user.must_change_pin)return Response.json({error:'관리자만 변경 이력을 조회할 수 있습니다.'},{status:403});return Response.json({auditLogs:db.prepare(`SELECT al.*,su.display_name AS actor_display_name FROM audit_logs al LEFT JOIN staff_users su ON su.id=al.actor ORDER BY al.id DESC LIMIT 300`).all()});}
     return Response.json(snapshot(user));
   }
@@ -246,9 +256,17 @@ async function handlePOST(request:Request) {
       invalidateAuthSession(request,db);
       logChange(db,'로그아웃','사용자',user.id,null,null,'로그아웃',user.id,'',requestIp(request));
       return clearSessionCookie(Response.json({ok:true}));
+    } else if (body.action === 'participantPhoneSearch') {
+      const supplied=text(body.phone).trim();
+      if(!supplied||!/^[0-9\s-]+$/.test(supplied))throw new ActionError('전화번호 전체를 입력하세요.');
+      const normalized=supplied.replace(/\D/g,'');
+      if(!/^\d{10,11}$/.test(normalized))throw new ActionError('전화번호는 전체 10~11자리를 입력하세요.');
+      const matches=db.prepare(`SELECT id,name,member_status,REPLACE(REPLACE(TRIM(phone),'-',''),' ','') AS normalized_phone FROM participants WHERE REPLACE(REPLACE(TRIM(phone),'-',''),' ','')=? ORDER BY name,id LIMIT 5`).all(normalized) as {id:string;name:string;member_status:string;normalized_phone:string}[];
+      const maskPhone=(value:string)=>value.length===11?`${value.slice(0,3)}-****-${value.slice(-4)}`:`${value.slice(0,3)}-***-${value.slice(-4)}`;
+      return Response.json({results:matches.map(({id,name,member_status,normalized_phone})=>({id,name,member_status,masked_phone:maskPhone(normalized_phone)}))});
     } else if (body.action === 'createParticipant') {
       const duplicate=db.prepare(`SELECT id,name,phone FROM participants WHERE TRIM(name)=TRIM(?) AND REPLACE(REPLACE(phone,'-',''),' ','')=REPLACE(REPLACE(?,'-',''),' ','')`).get(text(body.name),text(body.phone)) as {id:string;name:string;phone:string}|undefined;
-      if(duplicate) return Response.json({error:`동일한 이름과 연락처의 참가자(${duplicate.id})가 이미 있습니다. 기존 참가자를 확인하거나 중복 병합을 이용하세요.`,duplicate},{status:409});
+      if(duplicate) return Response.json({error:`동일한 이름과 연락처의 참가자(${duplicate.id})가 이미 있습니다. 기존 참가자를 확인하거나 중복 병합을 이용하세요.`,duplicate:{id:duplicate.id,name:duplicate.name,phoneMatched:true}},{status:409});
       const id = `P-${today.slice(0,4)}-${String(Date.now()).slice(-6)}`;
       db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run(id,text(body.name),text(body.gender),Number(body.age||0),text(body.phone),text(body.memberStatus),text(body.note),today);
       const programIds = Array.isArray(body.programIds) ? body.programIds.map(text) : [];
@@ -259,7 +277,7 @@ async function handlePOST(request:Request) {
       const before=db.prepare('SELECT * FROM participants WHERE id=?').get(text(body.id)) as Record<string,unknown>|undefined;
       if(!before)throw new ActionError('참가자를 찾을 수 없습니다.');
       const participantId=String(before.id),duplicate=db.prepare(`SELECT id,name,phone FROM participants WHERE id<>? AND TRIM(name)=TRIM(?) AND REPLACE(REPLACE(phone,'-',''),' ','')=REPLACE(REPLACE(?,'-',''),' ','')`).get(participantId,text(body.name),text(body.phone)) as {id:string;name:string;phone:string}|undefined;
-      if(duplicate) return Response.json({error:`수정하려는 정보가 기존 참가자(${duplicate.id})와 중복됩니다. 중복 병합을 이용하세요.`,duplicate},{status:409});
+      if(duplicate) return Response.json({error:`수정하려는 정보가 기존 참가자(${duplicate.id})와 중복됩니다. 중복 병합을 이용하세요.`,duplicate:{id:duplicate.id,name:duplicate.name,phoneMatched:true}},{status:409});
       db.prepare('UPDATE participants SET name=?,gender=?,age=?,phone=?,member_status=?,note=? WHERE id=?').run(text(body.name),text(body.gender),Number(body.age||0),text(body.phone),text(body.memberStatus),text(body.note),participantId);
       const after={name:text(body.name),gender:text(body.gender),age:Number(body.age||0),phone:text(body.phone),member_status:text(body.memberStatus),note:text(body.note)};const fields=changedFields(before as Record<string,unknown>|undefined,after,['name','gender','age','phone','member_status','note']);
       logChange(db,'수정','참가자',participantId,null,{changed_fields:fields,name_changed:fields.includes('name'),phone_changed:fields.includes('phone'),memo_changed:fields.includes('note')},'참가자 기본정보 수정',user.id,'',requestIp(request));

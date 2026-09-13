@@ -9,13 +9,13 @@ const ADMIN_ACTIONS=[
   'createParticipant','updateParticipant','createProgram','createRun','updateProgram','updateRunStatus','updateSession','createScheduleEvent',
   'apply','assignRun','applyToRun','applicationStatus','attendance','attendanceBulk','closeAttendanceSession','reopenAttendanceSession',
   'mergeParticipants','createUser','updateUser','changeMyPin','recordAccess','addAssessmentType','setAssessmentActive',
-  'setProgramAssessments','saveAssessmentScore','saveSatisfaction','settings','backup','checkBackup','restoreBackup','certificate','import','logout',
+  'setProgramAssessments','saveAssessmentScore','saveSatisfaction','participantPhoneSearch','settings','backup','checkBackup','restoreBackup','certificate','import','logout',
 ] as const;
 
 const GENERAL_ACTIONS=[
   'createParticipant','updateParticipant','createProgram','createRun','updateProgram','updateRunStatus','updateSession','createScheduleEvent',
   'apply','assignRun','applyToRun','applicationStatus','attendance','attendanceBulk','closeAttendanceSession','changeMyPin','recordAccess',
-  'addAssessmentType','setAssessmentActive','setProgramAssessments','saveAssessmentScore','saveSatisfaction','certificate','import','logout',
+  'addAssessmentType','setAssessmentActive','setProgramAssessments','saveAssessmentScore','saveSatisfaction','participantPhoneSearch','certificate','import','logout',
 ] as const;
 
 const ATTENDANCE_ACTIONS=['attendance','attendanceBulk','closeAttendanceSession','changeMyPin','logout'] as const;

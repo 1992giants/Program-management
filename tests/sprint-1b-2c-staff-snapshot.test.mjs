@@ -51,10 +51,12 @@ test('역할별 login, GET, mutation snapshot은 서버 경계에서 필요한 �
       assert.deepEqual(body.certificates,[]);
       assert.deepEqual(body.duplicateGroups,[]);
       const participant=body.participants.find(item=>item.id==='P-SNAPSHOT-1');
-      for(const key of ['id','name','phone','gender','age','member_status','application_count','attended_count'])assert.equal(Object.hasOwn(participant,key),true,key);
+      for(const key of ['id','name','gender','age','member_status','application_count','attended_count'])assert.equal(Object.hasOwn(participant,key),true,key);
+      assert.equal(Object.hasOwn(participant,'phone'),false);
       for(const key of ['note','created_at','last_visit'])assert.equal(Object.hasOwn(participant,key),false,key);
       const application=body.applications.find(item=>item.id===501);
-      for(const key of ['id','participant_id','program_id','run_id','applied_at','status','queue_number','reason_present','participant_name','phone','gender','age','member_status','program_name','run_label','delivery_type','session_count','start_date'])assert.equal(Object.hasOwn(application,key),true,key);
+      for(const key of ['id','participant_id','program_id','run_id','applied_at','status','queue_number','reason_present','participant_name','gender','age','member_status','program_name','run_label','delivery_type','session_count','start_date'])assert.equal(Object.hasOwn(application,key),true,key);
+      assert.equal(Object.hasOwn(application,'phone'),false);
       for(const key of ['status_reason','status_updated_at','assigned_at','round_number'])assert.equal(Object.hasOwn(application,key),false,key);
       assert.equal(application.reason_present,reasonPresent);
       const serialized=JSON.stringify(body);
@@ -62,6 +64,8 @@ test('역할별 login, GET, mutation snapshot은 서버 경계에서 필요한 �
       assert.equal(serialized.includes('참가자 메모'),false);
       assert.equal(serialized.includes('중복 참가자 메모'),false);
       assert.equal(serialized.includes('APPLICATION_REASON_SECRET_SENTINEL'),false);
+      assert.equal(serialized.includes('010-1234-5678'),false);
+      assert.equal(serialized.includes('010-9999-9999'),false);
       assert.equal(serialized.includes(process.env.ONMAEUM_TEST_DB_PATH),false);
     };
 
@@ -76,7 +80,8 @@ test('역할별 login, GET, mutation snapshot은 서버 경계에서 필요한 �
     const updatedBody=await updated.json();
     assertStaffBoundary(updatedBody);
     const updatedParticipant=updatedBody.participants.find(item=>item.id==='P-SNAPSHOT-1');
-    assert.deepEqual({name:updatedParticipant.name,phone:updatedParticipant.phone,gender:updatedParticipant.gender,age:updatedParticipant.age,member_status:updatedParticipant.member_status},{name:'김운영 수정',phone:'010-1234-5678',gender:'여성',age:41,member_status:'회원'});
+    assert.deepEqual({name:updatedParticipant.name,gender:updatedParticipant.gender,age:updatedParticipant.age,member_status:updatedParticipant.member_status},{name:'김운영 수정',gender:'여성',age:41,member_status:'회원'});
+    assert.equal(Object.hasOwn(updatedParticipant,'phone'),false);
     assert.equal(Object.hasOwn(updatedParticipant,'note'),false);
     assert.deepEqual({...db.prepare('SELECT name,phone,gender,age,member_status,note FROM participants WHERE id=?').get('P-SNAPSHOT-1')},{name:'김운영 수정',phone:'010-1234-5678',gender:'여성',age:41,member_status:'회원',note:'참가자 메모'});
 
