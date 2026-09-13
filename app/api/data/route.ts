@@ -91,7 +91,7 @@ function staffSnapshot(currentUser:SafeUser) {
     programs:rows(`SELECT p.id,p.name,p.category,p.delivery_type,p.session_count,p.recurrence,p.location,p.manager,p.capacity,p.status,COUNT(DISTINCT r.id) AS run_count,COUNT(DISTINCT a.id) AS applicant_count FROM programs p LEFT JOIN program_runs r ON r.program_id=p.id LEFT JOIN applications a ON a.program_id=p.id GROUP BY p.id ORDER BY p.created_at DESC`),
     runs:rows(`SELECT r.id,r.program_id,r.round_number,r.label,r.start_date,r.status,r.closed_at,r.closed_by,p.name AS program_name,p.delivery_type,p.session_count,p.capacity,p.manager,COUNT(DISTINCT a.id) AS applicant_count FROM program_runs r JOIN programs p ON p.id=r.program_id LEFT JOIN applications a ON a.run_id=r.id GROUP BY r.id ORDER BY r.start_date DESC,r.round_number DESC`),
     sessions:rows(`SELECT s.id,s.run_id,s.session_number,s.session_date,s.session_time,s.location,s.attendance_status,s.attendance_closed_at,s.attendance_closed_by,r.program_id,r.label AS run_label,p.name AS program_name FROM sessions s JOIN program_runs r ON r.id=s.run_id JOIN programs p ON p.id=r.program_id ORDER BY s.session_date DESC,s.session_time`),
-    applications:rows(`SELECT a.id,a.participant_id,a.program_id,a.run_id,a.applied_at,a.status,a.queue_number,a.status_reason,p.name AS participant_name,p.phone,p.gender,p.age,p.member_status,pr.name AS program_name,COALESCE(r.label,'차수 미배정') AS run_label,pr.delivery_type,pr.session_count,r.start_date FROM applications a JOIN participants p ON p.id=a.participant_id JOIN programs pr ON pr.id=a.program_id LEFT JOIN program_runs r ON r.id=a.run_id ORDER BY a.applied_at DESC,a.id DESC`),
+    applications:rows(`SELECT a.id,a.participant_id,a.program_id,a.run_id,a.applied_at,a.status,a.queue_number,CASE WHEN TRIM(COALESCE(a.status_reason,''))<>'' THEN 1 ELSE 0 END AS reason_present,p.name AS participant_name,p.phone,p.gender,p.age,p.member_status,pr.name AS program_name,COALESCE(r.label,'차수 미배정') AS run_label,pr.delivery_type,pr.session_count,r.start_date FROM applications a JOIN participants p ON p.id=a.participant_id JOIN programs pr ON pr.id=a.program_id LEFT JOIN program_runs r ON r.id=a.run_id ORDER BY a.applied_at DESC,a.id DESC`),
     attendance:rows(`SELECT at.id,at.application_id,at.session_id,at.status,a.participant_id,a.run_id,s.session_number,s.session_date,pr.name AS program_name,r.label AS run_label FROM attendance at JOIN applications a ON a.id=at.application_id JOIN sessions s ON s.id=at.session_id AND s.run_id=a.run_id JOIN program_runs r ON r.id=a.run_id AND r.program_id=a.program_id JOIN programs pr ON pr.id=a.program_id ORDER BY s.session_date DESC`),
     certificates:[],backupFiles:[],users:[],currentUser,
     assessmentCatalog:rows(`SELECT id,name,min_score,max_score,active,created_at,version,description FROM assessment_catalog ORDER BY active DESC,name`),
@@ -197,6 +197,19 @@ async function handleGET(request:Request) {
       const scheduleEvents=db.prepare(`SELECT id,event_type,color,participant_id,title,event_date,all_day,start_time,delivery_mode FROM schedule_events WHERE event_date>=? AND event_date<=? ORDER BY event_date,all_day DESC,start_time,id`).all(from,to);
       return Response.json({from,to,scheduleEvents});
     }
+    if(resource==='application-reason'){
+      if(user.must_change_pin)return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});
+      if(!['관리자','일반 담당자'].includes(user.role))return Response.json({error:'신청 상태 사유를 조회할 권한이 없습니다.'},{status:403});
+      const idValues=params.getAll('id');
+      if(idValues.length!==1)throw new ActionError('신청 기록 ID를 하나만 지정하세요.');
+      const rawId=idValues[0].trim();
+      if(!/^[1-9][0-9]*$/.test(rawId))throw new ActionError('올바른 신청 기록 ID를 입력하세요.');
+      const requestedId=Number(rawId);
+      if(!Number.isSafeInteger(requestedId))throw new ActionError('올바른 신청 기록 ID를 입력하세요.');
+      const application=db.prepare(`SELECT id,COALESCE(status_reason,'') AS status_reason FROM applications WHERE id=?`).get(requestedId) as {id:number;status_reason:string}|undefined;
+      if(!application)return Response.json({error:'신청 기록을 찾을 수 없습니다.'},{status:404});
+      return Response.json({applicationId:application.id,statusReason:application.status_reason});
+    }
     if(resource==='participant'){if(user.must_change_pin)return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!['관리자','일반 담당자'].includes(user.role))return Response.json({error:'참가자 상세정보를 조회할 권한이 없습니다.'},{status:403});const requestedId=(params.get('id')||'').trim();if(!requestedId)return Response.json({error:'참가자 ID를 입력하세요.'},{status:400});const participant=db.prepare("SELECT id,name,phone,gender,age,member_status,COALESCE(note,'') AS note FROM participants WHERE id=?").get(requestedId);if(!participant)return Response.json({error:'참가자를 찾을 수 없습니다.'},{status:404});return Response.json({participant});}
     if(resource==='audit'){if(user.role!=='관리자'||user.must_change_pin)return Response.json({error:'관리자만 변경 이력을 조회할 수 있습니다.'},{status:403});return Response.json({auditLogs:db.prepare(`SELECT al.*,su.display_name AS actor_display_name FROM audit_logs al LEFT JOIN staff_users su ON su.id=al.actor ORDER BY al.id DESC LIMIT 300`).all()});}
     return Response.json(snapshot(user));
@@ -227,6 +240,7 @@ async function handlePOST(request:Request) {
     if(!user)return loginRequired('로그인이 만료되었습니다.');
     const action=text(body.action);if(user.must_change_pin&&!['changeMyPin','logout'].includes(action))return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!canPerformAction(user,action))return Response.json({error:`${user.role} 권한으로는 이 작업을 수행할 수 없습니다.`},{status:403});
     let responseWarning='';
+    let updatedApplicationReason:{applicationId:number;reasonPresent:boolean;statusReason:string}|undefined;
     let invalidateCurrentSession=false;
     if(body.action==='logout'){
       invalidateAuthSession(request,db);
@@ -305,6 +319,8 @@ async function handlePOST(request:Request) {
       if(!before||!statuses.includes(status))throw new ActionError('올바른 신청 상태를 선택하세요.');
       if(['중도탈락','취소'].includes(status)&&!reason)throw new ActionError(`${status} 사유를 입력하세요.`);
       const applicationId=Number((before as Record<string,unknown>).id);db.prepare('UPDATE applications SET status=?,status_reason=?,status_updated_at=? WHERE id=?').run(status,reason,new Date().toISOString(),applicationId);
+      const canonical=db.prepare(`SELECT id,COALESCE(status_reason,'') AS status_reason FROM applications WHERE id=?`).get(applicationId) as {id:number;status_reason:string};
+      updatedApplicationReason={applicationId:canonical.id,reasonPresent:canonical.status_reason.trim()!=='',statusReason:canonical.status_reason};
       logChange(db,'상태 변경','신청',applicationId,{status:(before as Record<string,unknown>).status},{status,reason_present:Boolean(reason)},`신청 현황을 ${status}(으)로 변경`,user.id,'',requestIp(request));
     } else if (body.action === 'attendance') {
       const requestedSessionId=text(body.sessionId),requestedApplicationId=Number(body.applicationId),status=text(body.status),noteText=text(body.note).trim(),validStatuses=['참석','결석','보강','취소','노쇼','기타','미입력'];if(!validStatuses.includes(status))throw new ActionError('올바른 출석 상태를 선택하세요.');if(['결석','취소','노쇼','기타'].includes(status)&&!noteText)throw new ActionError(`${status} 사유나 연락 결과를 입력하세요.`);const sessionState=canonicalAttendanceScope(db,requestedSessionId);if(sessionState.attendanceStatus==='마감')throw new ActionError('마감된 회기의 출석은 수정할 수 없습니다. 관리자가 회기를 다시 열어야 합니다.');const application=db.prepare('SELECT id,run_id,program_id,status FROM applications WHERE id=?').get(requestedApplicationId) as AttendanceApplication|undefined;if(!application||!attendanceApplicationMatchesScope(application,sessionState))throw new ActionError('해당 프로그램과 차수에 배정된 참가자만 출석을 입력할 수 있습니다.');if(['취소','중도탈락'].includes(application.status))throw new ActionError('취소·중도탈락 신청에는 출석을 입력할 수 없습니다.');const sessionId=sessionState.sessionId,applicationId=application.id,makeupFor=text(body.makeupForSessionId);if(makeupFor){const makeupSession=db.prepare('SELECT id,run_id FROM sessions WHERE id=?').get(makeupFor) as {id:string;run_id:string}|undefined;if(!makeupSession)throw new ActionError('보강 대상 회기를 찾을 수 없습니다.');if(makeupSession.run_id!==sessionState.runId)throw new ActionError('같은 차수의 회기만 보강 대상으로 지정할 수 있습니다.');}
@@ -421,7 +437,7 @@ async function handlePOST(request:Request) {
       }
     } else return Response.json({error:'지원하지 않는 작업입니다.'},{status:400});
     if(invalidateCurrentSession)return clearSessionCookie(Response.json({ok:true,loginRequired:true}));
-    return Response.json({...snapshot(user),...(responseWarning?{warning:responseWarning}:{})});
+    return Response.json({...snapshot(user),...(responseWarning?{warning:responseWarning}:{}),...(updatedApplicationReason?{updatedApplicationReason}:{})});
   } catch(error) { return error instanceof ActionError?Response.json({error:error.message},{status:400}):internalError(error); }
 }
 

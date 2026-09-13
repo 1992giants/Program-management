@@ -30,7 +30,7 @@ test('역할별 login, GET, mutation snapshot은 서버 경계에서 필요한 �
     db.prepare("INSERT INTO programs (id,name,category,delivery_type,session_count,recurrence,location,manager,capacity,status,created_at) VALUES ('PRG-SNAPSHOT','회복 프로그램','회복','집단',1,'매주','센터','담당자',10,'운영 중',?)").run(today);
     db.prepare("INSERT INTO program_runs (id,program_id,round_number,label,start_date,status) VALUES ('RUN-SNAPSHOT','PRG-SNAPSHOT',3,'3차',?,'진행 중')").run(today);
     db.prepare("INSERT INTO sessions (id,run_id,session_number,session_date,session_time,location,reopen_reason) VALUES ('SESSION-SNAPSHOT','RUN-SNAPSHOT',1,?,'10:00','센터','관리자 전용 재개 사유')").run(today);
-    db.prepare("INSERT INTO applications (id,participant_id,program_id,run_id,applied_at,status,queue_number,status_reason,status_updated_at,assigned_at) VALUES (501,'P-SNAPSHOT-1','PRG-SNAPSHOT','RUN-SNAPSHOT',?,'참가중',2,'신청 사유',?,?)").run(today,today,today);
+    db.prepare("INSERT INTO applications (id,participant_id,program_id,run_id,applied_at,status,queue_number,status_reason,status_updated_at,assigned_at) VALUES (501,'P-SNAPSHOT-1','PRG-SNAPSHOT','RUN-SNAPSHOT',?,'참가중',2,'APPLICATION_REASON_SECRET_SENTINEL',?,?)").run(today,today,today);
     db.prepare("INSERT INTO attendance (application_id,session_id,status,note) VALUES (501,'SESSION-SNAPSHOT','참석','출석 상세')").run();
     db.prepare("INSERT INTO certificates (participant_id,issued_at,session_count) VALUES ('P-SNAPSHOT-1',?,1)").run(today);
     db.prepare("INSERT INTO assessment_scores (application_id,assessment_id,pre_score,post_score,note,updated_at) VALUES (501,'ASM-PHQ9',9,4,'검사 메모',?)").run(today);
@@ -40,7 +40,7 @@ test('역할별 login, GET, mutation snapshot은 서버 경계에서 필요한 �
     const post=(body,cookie)=>POST(new Request(origin+'/api/data',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{})},body:JSON.stringify(body)}));
     const get=cookie=>GET(new Request(origin+'/api/data',{headers:{Cookie:cookie}}));
     const login=async(username,pin)=>{const response=await post({action:'login',username,pin});assert.equal(response.status,200);return {body:await response.json(),cookie:response.headers.get('set-cookie').split(';')[0]}};
-    const assertStaffBoundary=body=>{
+    const assertStaffBoundary=(body,reasonPresent=1)=>{
       assert.equal(body.currentUser.role,'일반 담당자');
       assert.deepEqual(Object.keys(body.settings),['center_name']);
       for(const key of ['application_id','database_environment','internal_snapshot_secret','manager_name'])assert.equal(Object.hasOwn(body.settings,key),false,key);
@@ -54,12 +54,14 @@ test('역할별 login, GET, mutation snapshot은 서버 경계에서 필요한 �
       for(const key of ['id','name','phone','gender','age','member_status','application_count','attended_count'])assert.equal(Object.hasOwn(participant,key),true,key);
       for(const key of ['note','created_at','last_visit'])assert.equal(Object.hasOwn(participant,key),false,key);
       const application=body.applications.find(item=>item.id===501);
-      for(const key of ['id','participant_id','program_id','run_id','applied_at','status','queue_number','status_reason','participant_name','phone','gender','age','member_status','program_name','run_label','delivery_type','session_count','start_date'])assert.equal(Object.hasOwn(application,key),true,key);
-      for(const key of ['status_updated_at','assigned_at','round_number'])assert.equal(Object.hasOwn(application,key),false,key);
+      for(const key of ['id','participant_id','program_id','run_id','applied_at','status','queue_number','reason_present','participant_name','phone','gender','age','member_status','program_name','run_label','delivery_type','session_count','start_date'])assert.equal(Object.hasOwn(application,key),true,key);
+      for(const key of ['status_reason','status_updated_at','assigned_at','round_number'])assert.equal(Object.hasOwn(application,key),false,key);
+      assert.equal(application.reason_present,reasonPresent);
       const serialized=JSON.stringify(body);
       assert.equal(serialized.includes('do-not-send-setting'),false);
       assert.equal(serialized.includes('참가자 메모'),false);
       assert.equal(serialized.includes('중복 참가자 메모'),false);
+      assert.equal(serialized.includes('APPLICATION_REASON_SECRET_SENTINEL'),false);
       assert.equal(serialized.includes(process.env.ONMAEUM_TEST_DB_PATH),false);
     };
 
@@ -80,7 +82,7 @@ test('역할별 login, GET, mutation snapshot은 서버 경계에서 필요한 �
 
     const statusChange=await post({action:'applicationStatus',id:501,status:'참가완료',reason:''},staffLogin.cookie);
     assert.equal(statusChange.status,200);
-    assertStaffBoundary(await statusChange.json());
+    assertStaffBoundary(await statusChange.json(),0);
 
     const attendanceLogin=await login('snapshot-attendance','24681357');
     assert.equal(attendanceLogin.body.currentUser.role,'출석 입력 전용');
