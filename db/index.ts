@@ -6,6 +6,18 @@ import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from
 let database: DatabaseSync | null = null;
 const APPLICATION_ID='onmaeum-program-care';
 
+export function withImmediateTransaction<T>(db:DatabaseSync,fn:()=>T):T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result=fn();
+    db.exec('COMMIT');
+    return result;
+  } catch(error) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw error;
+  }
+}
+
 type DatabaseEnvironment='production'|'development'|'test';
 
 function databaseEnvironment():DatabaseEnvironment {
