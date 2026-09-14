@@ -1,8 +1,8 @@
 const requestedModes=new Set(process.argv.slice(2));
-const supportedModes=new Set(['initialize','adopt','migrate','validate']);
+const supportedModes=new Set(['initialize','adopt','migrate','migrate-schema','validate']);
 const {existsSync,rmSync}=await import('node:fs');
 
-if(!requestedModes.size||[...requestedModes].some(mode=>!supportedModes.has(mode))||requestedModes.has('validate')&&requestedModes.size!==1||requestedModes.has('initialize')&&requestedModes.size!==1){
+if(!requestedModes.size||[...requestedModes].some(mode=>!supportedModes.has(mode))||requestedModes.has('validate')&&requestedModes.size!==1||requestedModes.has('initialize')&&requestedModes.size!==1||requestedModes.has('migrate-schema')&&requestedModes.size!==1){
   console.error('Production database command is invalid.');
   process.exit(2);
 }
@@ -25,20 +25,23 @@ let databasePath='';
 let databaseExisted=false;
 let db;
 try {
-  const {getDatabase,getDatabasePath}=await import('../db/index.ts');
+  const {adoptProductionDatabaseExplicitly,getDatabase,getDatabasePath,migrateLegacyAdministratorExplicitly,migrateProductionSchemaExplicitly,validateProductionDatabaseReadOnly}=await import('../db/index.ts');
   databasePath=getDatabasePath();
   databaseExisted=existsSync(databasePath);
-  db=getDatabase();
-  const integrity=db.prepare('PRAGMA integrity_check').all();
-  if(integrity.length!==1||integrity[0].integrity_check!=='ok')throw new Error('SQLite integrity_check failed.');
-
-  const settings=Object.fromEntries(db.prepare("SELECT key,value FROM settings WHERE key IN ('application_id','database_environment','usr_admin_migration_completed')").all().map(row=>[row.key,row.value]));
-  if(settings.application_id!=='onmaeum-program-care'||settings.database_environment!=='production')throw new Error('Production database marker validation failed.');
-  const administrators=db.prepare("SELECT COUNT(*) AS count FROM staff_users WHERE role='관리자' AND active=1").get().count;
-  if(administrators<1)throw new Error('An active production administrator is required.');
-  if(requestedModes.has('migrate')&&settings.usr_admin_migration_completed!=='1')throw new Error('USR-ADMIN migration completion marker is missing.');
-
-  console.log(JSON.stringify({ok:true,operation:[...requestedModes].join('+'),integrity:'ok',productionMarker:true,activeAdministrator:true}));
+  let result;
+  if(requestedModes.has('validate'))result=validateProductionDatabaseReadOnly();
+  else if(requestedModes.has('migrate-schema'))result=await migrateProductionSchemaExplicitly();
+  else if(requestedModes.has('initialize')){
+    process.env.ONMAEUM_INITIALIZE_PRODUCTION_DB='1';
+    db=getDatabase();
+    result=validateProductionDatabaseReadOnly();
+  } else {
+    if(requestedModes.has('adopt'))result=adoptProductionDatabaseExplicitly();
+    if(requestedModes.has('migrate'))result={...(result||{}),...migrateLegacyAdministratorExplicitly()};
+    const adoptedKnownV0=requestedModes.has('adopt')&&!requestedModes.has('migrate')&&result?.version===0;
+    if(!adoptedKnownV0)result={...(result||{}),...validateProductionDatabaseReadOnly()};
+  }
+  console.log(JSON.stringify({ok:true,operation:[...requestedModes].join('+'),...result}));
 } catch(error) {
   if(requestedModes.has('initialize')&&!databaseExisted&&databasePath){
     try { db?.close(); } catch {}

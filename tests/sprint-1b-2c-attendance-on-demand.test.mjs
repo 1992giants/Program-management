@@ -44,7 +44,7 @@ test('staff 출석 민감정보는 선택한 회기에서만 조회되고 mutati
     ];
     for(const row of applications)db.prepare('INSERT INTO applications (id,participant_id,program_id,run_id,applied_at,status,queue_number) VALUES (?,?,?,?,?,?,?)').run(row[0],row[1],row[2],row[3],today,row[4],row[0]-700);
     const attendanceRows=[
-      [701,'SESSION-ATT-A1','참석','ATTENDANCE_NOTE_A_SENTINEL','2099-01-01T01:02:03.000Z','MAKEUP_PRIVATE_SENTINEL'],
+      [701,'SESSION-ATT-A1','참석','ATTENDANCE_NOTE_A_SENTINEL','2099-01-01T01:02:03.000Z','SESSION-ATT-A2'],
       [701,'SESSION-ATT-A2','결석','ATTENDANCE_NOTE_A2_SENTINEL','2099-01-02T01:02:03.000Z',null],
       [701,'SESSION-ATT-A-CLOSED','참석','ATTENDANCE_CLOSED_SENTINEL',null,null],
       [702,'SESSION-ATT-B1','참석','ATTENDANCE_NOTE_B_SENTINEL','2099-02-01T01:02:03.000Z',null],
@@ -59,7 +59,7 @@ test('staff 출석 민감정보는 선택한 회기에서만 조회되고 mutati
     const get=(url,cookie)=>GET(request('GET',url,cookie));
     const post=(body,cookie)=>POST(request('POST','/api/data',cookie,body));
     const login=async(username,pin)=>{const response=await post({action:'login',username,pin});assert.equal(response.status,200);return {body:await response.json(),cookie:response.headers.get('set-cookie').split(';')[0]}};
-    const secrets=['ATTENDANCE_NOTE_A_SENTINEL','2099-01-01T01:02:03.000Z','MAKEUP_PRIVATE_SENTINEL','ATTENDANCE_NOTE_A2_SENTINEL','2099-01-02T01:02:03.000Z','ATTENDANCE_CLOSED_SENTINEL','ATTENDANCE_NOTE_B_SENTINEL','2099-02-01T01:02:03.000Z','ATTENDANCE_INCONSISTENT_SENTINEL','ATTENDANCE_CANCELLED_SENTINEL','ATTENDANCE_WITHDRAWN_SENTINEL','CROSS_PROGRAM_NOTE_SENTINEL','SAVE_NOTE_SENTINEL'];
+    const secrets=['ATTENDANCE_NOTE_A_SENTINEL','2099-01-01T01:02:03.000Z','ATTENDANCE_NOTE_A2_SENTINEL','2099-01-02T01:02:03.000Z','ATTENDANCE_CLOSED_SENTINEL','ATTENDANCE_NOTE_B_SENTINEL','2099-02-01T01:02:03.000Z','ATTENDANCE_INCONSISTENT_SENTINEL','ATTENDANCE_CANCELLED_SENTINEL','ATTENDANCE_WITHDRAWN_SENTINEL','CROSS_PROGRAM_NOTE_SENTINEL','SAVE_NOTE_SENTINEL'];
     const assertStaffSummary=body=>{
       assert.equal(body.currentUser.role,'일반 담당자');
       assert.ok(body.attendance.length>=4);

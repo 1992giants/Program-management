@@ -4,7 +4,8 @@ param(
   [int]$Port = 3000,
   [switch]$InitializeProductionDatabase,
   [switch]$AdoptProductionDatabase,
-  [switch]$MigrateUsrAdmin
+  [switch]$MigrateUsrAdmin,
+  [switch]$MigrateSchema
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,8 +52,11 @@ try {
     throw "운영 DB는 서버 PC의 로컬 절대경로여야 합니다."
   }
 
-  if ($InitializeProductionDatabase -and ($AdoptProductionDatabase -or $MigrateUsrAdmin)) {
+  if ($InitializeProductionDatabase -and ($AdoptProductionDatabase -or $MigrateUsrAdmin -or $MigrateSchema)) {
     throw "신규 DB 초기화 모드는 기존 DB adoption 또는 USR-ADMIN migration과 함께 사용할 수 없습니다."
+  }
+  if ($MigrateSchema -and ($AdoptProductionDatabase -or $MigrateUsrAdmin)) {
+    throw "schema migration은 adoption 또는 USR-ADMIN migration과 분리해 실행하세요."
   }
 
   if ($env:ONMAEUM_DB_PATH.StartsWith("\\")) {
@@ -71,7 +75,7 @@ try {
     "ONMAEUM_BOOTSTRAP_ADMIN_DISPLAY_NAME",
     "ONMAEUM_BOOTSTRAP_ADMIN_PIN"
   )
-  $IsOneShot = $InitializeProductionDatabase -or $AdoptProductionDatabase -or $MigrateUsrAdmin
+  $IsOneShot = $InitializeProductionDatabase -or $AdoptProductionDatabase -or $MigrateUsrAdmin -or $MigrateSchema
   if ($IsOneShot) {
     if ($InitializeProductionDatabase) {
       if (Test-Path -LiteralPath $env:ONMAEUM_DB_PATH) {
@@ -85,6 +89,7 @@ try {
     if ($InitializeProductionDatabase) { $CommandModes += "initialize" }
     if ($AdoptProductionDatabase) { $CommandModes += "adopt" }
     if ($MigrateUsrAdmin) { $CommandModes += "migrate" }
+    if ($MigrateSchema) { $CommandModes += "migrate-schema" }
     $LocalEnvPath = Join-Path $CenterAppRoot ".env.local"
     & node "--env-file-if-exists=$LocalEnvPath" --experimental-strip-types (Join-Path $CenterAppRoot "scripts\production-database.mjs") @CommandModes
     if ($LASTEXITCODE -ne 0) {
@@ -98,6 +103,8 @@ try {
       Write-Host "Production database adoption and USR-ADMIN migration completed."
     } elseif ($AdoptProductionDatabase) {
       Write-Host "Production database adoption completed."
+    } elseif ($MigrateSchema) {
+      Write-Host "Production database schema migration completed."
     } else {
       Write-Host "USR-ADMIN migration completed."
     }
