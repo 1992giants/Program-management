@@ -1,4 +1,5 @@
 import { backup, DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { createRun, getBackupDirectory, getDatabase, getDatabasePath, getStorageInfo, hashPin, verifyPin } from '../../../db/index.ts';
@@ -283,16 +284,33 @@ async function handlePOST(request:Request) {
       logChange(db,'수정','참가자',participantId,null,{changed_fields:fields,name_changed:fields.includes('name'),phone_changed:fields.includes('phone'),memo_changed:fields.includes('note')},'참가자 기본정보 수정',user.id,'',requestIp(request));
     } else if (body.action === 'createProgram') {
       const id = `PRG-${String(Date.now()).slice(-6)}`;
-      const capacity = body.deliveryType === '1:1' ? 1 : Number(body.capacity||10);
-      db.prepare('INSERT INTO programs (id,name,category,delivery_type,session_count,recurrence,location,manager,capacity,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(id,text(body.name),text(body.category),text(body.deliveryType),Number(body.sessionCount),text(body.recurrence),text(body.location),text(body.manager),capacity,'운영 중',today);
-      createRun(db,id,1,String(body.runLabel||'1차'),String(body.startDate),String(body.time));
+      const name=text(body.name).trim(),sessionCount=Number(body.sessionCount),startDate=text(body.startDate),capacity=body.deliveryType==='1:1'?1:Number(body.capacity||10);
+      if(!name||!Number.isInteger(sessionCount)||sessionCount<1||!Number.isInteger(capacity)||capacity<1||!isCanonicalCalendarDate(startDate))throw new ActionError('프로그램명, 회기 수, 정원과 첫 회기 날짜를 올바르게 입력하세요.');
+      db.prepare('INSERT INTO programs (id,name,category,delivery_type,session_count,recurrence,location,manager,capacity,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(id,name,text(body.category),text(body.deliveryType),sessionCount,text(body.recurrence),text(body.location),text(body.manager),capacity,'운영 중',today);
+      const runId=createRun(db,id,1,String(body.runLabel||'1차'),startDate,String(body.time));
+      const createdProgram=db.prepare('SELECT id,manager,capacity FROM programs WHERE id=?').get(id) as {id:string;manager:string;capacity:number};
+      const createdRun=db.prepare('SELECT id FROM program_runs WHERE id=? AND program_id=?').get(runId,createdProgram.id) as {id:string};
+      const createdSessionCount=(db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE run_id=?').get(createdRun.id) as {count:number}).count;
+      logChange(db,'program_create','프로그램',createdProgram.id,null,{run_id:createdRun.id,session_count:createdSessionCount,capacity_present:createdProgram.capacity>0,manager_present:Boolean(createdProgram.manager.trim())},'프로그램 및 최초 차수 생성',user.id,'',requestIp(request));
     } else if (body.action === 'createRun') {
-      const last = db.prepare('SELECT COALESCE(MAX(round_number),0) AS max_round FROM program_runs WHERE program_id=?').get(text(body.programId)) as {max_round:number};
-      createRun(db,String(body.programId),last.max_round+1,String(body.label),String(body.startDate),String(body.time));
+      const requestedProgramId=text(body.programId),program=db.prepare('SELECT id FROM programs WHERE id=?').get(requestedProgramId) as {id:string}|undefined;
+      if(!program)throw new ActionError('프로그램을 찾을 수 없습니다.');
+      const last = db.prepare('SELECT COALESCE(MAX(round_number),0) AS max_round FROM program_runs WHERE program_id=?').get(program.id) as {max_round:number};
+      const runId=createRun(db,program.id,last.max_round+1,String(body.label),String(body.startDate),String(body.time));
+      const createdRun=db.prepare('SELECT id,program_id FROM program_runs WHERE id=? AND program_id=?').get(runId,program.id) as {id:string;program_id:string};
+      const createdSessionCount=(db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE run_id=?').get(createdRun.id) as {count:number}).count;
+      logChange(db,'run_create','차수',createdRun.id,null,{program_id:createdRun.program_id,session_count:createdSessionCount},'프로그램 차수 생성',user.id,'',requestIp(request));
     } else if (body.action === 'updateProgram') {
-      const capacity = body.deliveryType === '1:1' ? 1 : Number(body.capacity||10);
-      db.prepare('UPDATE programs SET name=?,category=?,delivery_type=?,location=?,manager=?,capacity=?,status=? WHERE id=?').run(text(body.name),text(body.category),text(body.deliveryType),text(body.location),text(body.manager),capacity,text(body.status),text(body.id));
-      db.prepare('UPDATE sessions SET location=? WHERE run_id IN (SELECT id FROM program_runs WHERE program_id=?)').run(text(body.location),text(body.id));
+      const requestedProgramId=text(body.id),before=db.prepare('SELECT id,name,category,delivery_type,location,manager,capacity,status FROM programs WHERE id=?').get(requestedProgramId) as Record<string,unknown>|undefined;
+      if(!before)throw new ActionError('프로그램을 찾을 수 없습니다.');
+      const programId=String(before.id),capacity=body.deliveryType==='1:1'?1:Number(body.capacity||10),after={name:text(body.name),category:text(body.category),delivery_type:text(body.deliveryType),location:text(body.location),manager:text(body.manager),capacity,status:text(body.status)};
+      const allowedStatuses=['운영 중','운영 종료','일시 중단'];
+      if(!after.name.trim()||!after.category.trim()||!after.manager.trim()||!after.location.trim()||!Number.isInteger(capacity)||capacity<1||!allowedStatuses.includes(after.status))throw new ActionError('프로그램 정보를 올바르게 입력하세요.');
+      const fields=changedFields(before,after,['name','category','delivery_type','location','manager','capacity','status']);
+      const affectedSessionCount=(db.prepare(`SELECT COUNT(*) AS count FROM sessions WHERE run_id IN (SELECT id FROM program_runs WHERE program_id=?) AND COALESCE(location,'')<>?`).get(programId,after.location) as {count:number}).count;
+      db.prepare('UPDATE programs SET name=?,category=?,delivery_type=?,location=?,manager=?,capacity=?,status=? WHERE id=?').run(after.name,after.category,after.delivery_type,after.location,after.manager,after.capacity,after.status,programId);
+      db.prepare('UPDATE sessions SET location=? WHERE run_id IN (SELECT id FROM program_runs WHERE program_id=?)').run(after.location,programId);
+      logChange(db,'program_update','프로그램',programId,null,{changed_fields:fields,...(fields.includes('status')?{status_before:String(before.status),status_after:after.status}:{}),name_changed:fields.includes('name'),manager_changed:fields.includes('manager'),location_changed:fields.includes('location'),session_location_updated:affectedSessionCount>0,affected_session_count:affectedSessionCount},'프로그램 정보 수정',user.id,'',requestIp(request));
     } else if (body.action === 'updateRunStatus') {
       const statuses=['모집 예정','모집 중','모집 마감','참가자 확정','진행 중','종료','취소'],status=text(body.status),id=text(body.id),before=db.prepare('SELECT * FROM program_runs WHERE id=?').get(id);
       if(!before||!statuses.includes(status))throw new ActionError('올바른 차수 운영 상태를 선택하세요.');
@@ -445,14 +463,22 @@ async function handlePOST(request:Request) {
     } else if (body.action === 'certificate') {
       db.prepare('INSERT INTO certificates (participant_id,issued_at,session_count) VALUES (?,?,?)').run(text(body.participantId),today,Number(body.sessionCount));
     } else if (body.action === 'import') {
-      const input = Array.isArray(body.rows)?body.rows as Record<string,unknown>[]:[];
+      if(!Array.isArray(body.rows))throw new ActionError('가져올 행 목록을 올바르게 전송하세요.');
+      const input = body.rows as Record<string,unknown>[],operationId=`IMPORT-${randomUUID()}`;
+      let processedCount=0,participantCreatedCount=0,applicationCreatedCount=0,applicationUpdatedCount=0,duplicateCount=0,rejectedCount=0;
+      const participantUpdatedCount=0;
       for (const item of input.slice(0,1000)) {
-        const name=String(item.name||'').trim(); if(!name) continue;
+        processedCount+=1;
+        const name=String(item.name||'').trim(); if(!name){rejectedCount+=1;continue;}
         let participant=db.prepare('SELECT id FROM participants WHERE name=? AND phone=?').get(name,text(item.phone)) as {id:string}|undefined;
-        if(!participant){const id=`P-${today.slice(0,4)}-${String(Date.now()+Math.random()).replace(/\D/g,'').slice(-6)}`;db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run(id,name,text(item.gender)||'미입력',Number(item.age||0),text(item.phone),text(item.memberStatus)||'비회원','Excel 가져오기',today);participant={id};}
+        if(!participant){const id=`P-${today.slice(0,4)}-${String(Date.now()+Math.random()).replace(/\D/g,'').slice(-6)}`;db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run(id,name,text(item.gender)||'미입력',Number(item.age||0),text(item.phone),text(item.memberStatus)||'비회원','Excel 가져오기',today);participant={id};participantCreatedCount+=1;}else duplicateCount+=1;
         const program=db.prepare('SELECT id FROM programs WHERE name=?').get(text(item.programName)) as {id:string}|undefined;
-        if(program){const now=new Date().toISOString();db.prepare(`INSERT INTO applications (participant_id,program_id,run_id,applied_at,status,queue_number,status_updated_at) VALUES (?,?,NULL,?,'신청',?,?) ON CONFLICT(participant_id,program_id) DO UPDATE SET status='신청',status_reason='',status_updated_at=excluded.status_updated_at`).run(participant.id,program.id,text(item.appliedAt)||today,nextQueueNumber(db,program.id),now);}
+        if(!program){rejectedCount+=1;continue;}
+        const existingApplication=db.prepare('SELECT id FROM applications WHERE participant_id=? AND program_id=?').get(participant.id,program.id) as {id:number}|undefined,now=new Date().toISOString();
+        db.prepare(`INSERT INTO applications (participant_id,program_id,run_id,applied_at,status,queue_number,status_updated_at) VALUES (?,?,NULL,?,'신청',?,?) ON CONFLICT(participant_id,program_id) DO UPDATE SET status='신청',status_reason='',status_updated_at=excluded.status_updated_at`).run(participant.id,program.id,text(item.appliedAt)||today,nextQueueNumber(db,program.id),now);
+        if(existingApplication)applicationUpdatedCount+=1;else applicationCreatedCount+=1;
       }
+      logChange(db,'import_complete','가져오기',operationId,null,{processed_count:processedCount,participant_created_count:participantCreatedCount,participant_updated_count:participantUpdatedCount,application_created_count:applicationCreatedCount,application_updated_count:applicationUpdatedCount,duplicate_count:duplicateCount,rejected_count:rejectedCount},'Excel 참가자 및 신청 가져오기 완료',user.id,'',requestIp(request));
     } else return Response.json({error:'지원하지 않는 작업입니다.'},{status:400});
     if(invalidateCurrentSession)return clearSessionCookie(Response.json({ok:true,loginRequired:true}));
     return Response.json({...snapshot(user),...(responseWarning?{warning:responseWarning}:{}),...(updatedApplicationReason?{updatedApplicationReason}:{})});
