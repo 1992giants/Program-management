@@ -56,9 +56,15 @@ Sprint 1A 이전에 만들어진 marker 없는 기존 DB는 먼저 백업과 경
 .\start-center.ps1 -AdoptProductionDatabase
 ```
 
-핵심 Onmaeum 테이블과 SQLite 무결성이 확인된 경우에만 application·production marker가 기록되고 명령이 종료됩니다. development marker가 있는 DB는 production에서 열리지 않습니다. adoption 후에는 옵션 없이 서버를 별도 실행하세요.
+알려진 Onmaeum schema fingerprint와 SQLite 무결성이 확인된 경우에만 application·production marker가 기록되고 명령이 종료됩니다. development marker가 있는 DB는 production에서 열리지 않습니다. schema version이 0인 DB는 adoption 후 다음 명령으로 명시적 schema migration을 수행해야 합니다.
 
-marker 없는 기존 DB에 `USR-ADMIN`도 함께 남아 있다면 두 절차를 동시에 명시해야 합니다.
+```powershell
+.\start-center.ps1 -MigrateSchema
+```
+
+이 명령은 migration 전 안전 백업을 만들고, 알려진 v0 구조만 transaction 안에서 최신 schema로 올립니다. 성공 후에만 `PRAGMA user_version`이 갱신됩니다. 알 수 없는 구조, 보강 회기 orphan 참조, 더 높은 version은 자동 수정하지 않고 중단합니다. 동일 작업은 환경변수를 설정한 터미널에서 `npm run db:migrate-schema`로도 실행할 수 있습니다. 배포 시에는 `adopt`(필요한 경우) → `migrate-schema` → `validate` → 정상 시작 순서를 사용하세요.
+
+marker 없는 기존 DB에 `USR-ADMIN`도 함께 남아 있고 schema가 이미 current version이라면 두 절차를 동시에 명시할 수 있습니다. v0 DB라면 adoption → schema migration → USR-ADMIN migration을 각각 실행합니다.
 
 ```powershell
 .\start-center.ps1 -AdoptProductionDatabase -MigrateUsrAdmin
@@ -98,7 +104,8 @@ npm run audit:scan -- --database "C:\OnmaeumProgramCare\data\onmaeum.sqlite"
 
 - 운영 DB를 UNC 공유경로에 두지 마세요. SQLite 파일은 서버 PC에서만 열고 직원 PC는 브라우저로 접속합니다.
 - 운영 서버는 `ONMAEUM_DB_PATH`가 없으면 시작되지 않습니다. 개발 서버는 이 값을 사용하지 않고 `ONMAEUM_DEV_DB_PATH` 또는 별도의 기본 `data/development.sqlite`를 사용합니다.
-- production 일반 실행은 기존 DB만 열며, 신규 DB 생성·기존 DB adoption·USR-ADMIN migration은 서로 다른 명시적 일회성 모드로 구분됩니다.
+- production 일반 실행과 `validate`는 schema/data를 수정하지 않으며 version·schema·FK·marker·관리자 조건이 맞지 않으면 중단합니다.
+- 신규 DB 생성, 기존 DB adoption, schema migration, USR-ADMIN migration은 서로 다른 명시적 일회성 모드로 구분됩니다. 과거 `drizzle/` SQL은 이 runtime migration 경로에서 실행하지 않습니다.
 - 모든 일회성 모드는 작업과 무결성 확인 후 종료합니다. 일반 웹서버는 maintenance mode와 bootstrap credential을 전달하지 않은 별도 프로세스로만 시작합니다.
 - 개발용 더미 데이터는 development에서 `ONMAEUM_ENABLE_DEMO_SEED=1`을 명시한 경우에만 생성되며 production에서는 항상 차단됩니다.
 - 직원 계정은 공유하지 말고 관리자·일반 담당자·출석 입력 전용 권한을 업무에 맞게 부여하세요.

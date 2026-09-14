@@ -1,7 +1,10 @@
-import { DatabaseSync } from 'node:sqlite';
+import { backup, DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { CURRENT_SCHEMA_VERSION, classifyKnownV0Schema, createLatestSchema, migrateKnownV0Schema, schemaFingerprint, validateLatestSchema } from './schema-management.ts';
+
+export { CURRENT_SCHEMA_VERSION } from './schema-management.ts';
 
 let database: DatabaseSync | null = null;
 const APPLICATION_ID='onmaeum-program-care';
@@ -62,53 +65,63 @@ export function getDatabase() {
   if (networkPath && process.env.ONMAEUM_ALLOW_NETWORK_DB !== '1') {
     throw new Error('실시간 SQLite 파일은 네트워크 공유 경로에 둘 수 없습니다. 서버 PC의 로컬 경로를 사용하고 외장·네트워크 드라이브는 백업 경로로 지정하세요.');
   }
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  mkdirSync(getBackupDirectory(), { recursive: true });
+  if(environment==='production'&&fileExisted&&process.env.ONMAEUM_ADOPT_PRODUCTION_DB==='1')adoptProductionDatabaseExplicitly();
+  if(environment==='production'&&fileExisted&&process.env.ONMAEUM_MIGRATE_USR_ADMIN==='1')migrateLegacyAdministratorExplicitly();
+  if(!fileExisted)mkdirSync(path.dirname(filePath), { recursive: true });
+  if(environment!=='production'||initializeProduction)mkdirSync(getBackupDirectory(), { recursive: true });
   const candidate = new DatabaseSync(filePath);
   try {
-    const adopted=validateExistingDatabase(candidate,environment,fileExisted,process.env.ONMAEUM_ADOPT_PRODUCTION_DB==='1');
-    candidate.exec('PRAGMA foreign_keys = ON');
-    // DELETE journal mode is slower than WAL but works more reliably on removable
-    // drives and SMB-style internal shares when one server process owns the file.
-    candidate.exec('PRAGMA journal_mode = DELETE');
-    candidate.exec('PRAGMA synchronous = FULL');
-    candidate.exec('PRAGMA busy_timeout = 5000');
-    ensureDatabase(candidate,{
-      allowInitialAdministrator:environment!=='production'||initializeProduction,
-      migrateUsrAdmin:process.env.ONMAEUM_MIGRATE_USR_ADMIN==='1',
-    });
-    if(!fileExisted||adopted)writeDatabaseMarkers(candidate,environment);
+    configureConnection(candidate,{setJournalMode:!fileExisted});
+    if(!fileExisted){
+      withImmediateTransaction(candidate,()=>{
+        createLatestSchema(candidate);
+        bootstrapBaselineData(candidate);
+        bootstrapInitialAdministrator(candidate,new Date().toISOString().slice(0,10),{allowInitialAdministrator:true,migrateUsrAdmin:false});
+        writeDatabaseMarkers(candidate,environment);
+        if(environment!=='production'&&process.env.ONMAEUM_ENABLE_DEMO_SEED==='1')seedDatabase(candidate);
+      });
+    } else if(environment!=='production'&&Number((candidate.prepare('PRAGMA user_version').get() as {user_version:number}).user_version)===0){
+      migrateKnownV0Schema(candidate);
+    }
+    if(environment!=='production'&&fileExisted){
+      bootstrapBaselineData(candidate);
+      bootstrapInitialAdministrator(candidate,new Date().toISOString().slice(0,10),{allowInitialAdministrator:true,migrateUsrAdmin:process.env.ONMAEUM_MIGRATE_USR_ADMIN==='1'});
+      const participantCount=(candidate.prepare('SELECT COUNT(*) AS count FROM participants').get() as {count:number}).count;
+      if(process.env.ONMAEUM_ENABLE_DEMO_SEED==='1'&&!participantCount)withImmediateTransaction(candidate,()=>seedDatabase(candidate));
+    }
+    validateLatestSchema(candidate);
+    validateDatabaseIdentity(candidate,environment);
+    validateActiveAdministrator(candidate);
+    rejectUnreviewedLegacyAdministrator(candidate);
     database=candidate;
     return database;
   } catch(error) {
     candidate.close();
-    if(!fileExisted&&initializeProduction){rmSync(filePath,{force:true});rmSync(`${filePath}-journal`,{force:true});}
+    if(!fileExisted){rmSync(filePath,{force:true});rmSync(`${filePath}-journal`,{force:true});}
     throw error;
   }
 }
 
-function validateExistingDatabase(db:DatabaseSync,environment:DatabaseEnvironment,fileExisted:boolean,allowProductionAdoption:boolean) {
-  if(!fileExisted)return false;
-  const tables=new Set((db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as {name:string}[]).map(row=>row.name));
-  if(!tables.has('settings')){
-    if(environment==='production')throw new Error('지정한 파일은 Onmaeum 운영 DB로 확인되지 않습니다. 기존 DB를 자동 변경하지 않습니다.');
-    return false;
-  }
-  const marker=(key:string)=>(db.prepare('SELECT value FROM settings WHERE key=?').get(key) as {value:string}|undefined)?.value;
-  const applicationId=marker('application_id'),storedEnvironment=marker('database_environment');
+function configureConnection(db:DatabaseSync,{setJournalMode=false}:{setJournalMode?:boolean}={}){
+  db.exec('PRAGMA foreign_keys = ON');
+  if(setJournalMode)db.exec('PRAGMA journal_mode = DELETE');
+  db.exec('PRAGMA synchronous = FULL');
+  db.exec('PRAGMA busy_timeout = 5000');
+  const foreignKeys=Number((db.prepare('PRAGMA foreign_keys').get() as {foreign_keys:number}).foreign_keys);
+  if(foreignKeys!==1)throw new Error('SQLite foreign_keys must be enabled.');
+}
+
+function marker(db:DatabaseSync,key:string){return (db.prepare('SELECT value FROM settings WHERE key=?').get(key) as {value:string}|undefined)?.value}
+
+function validateDatabaseIdentity(db:DatabaseSync,environment:DatabaseEnvironment){
+  const applicationId=marker(db,'application_id'),storedEnvironment=marker(db,'database_environment');
+  if(!applicationId||!storedEnvironment)throw new Error('기존 marker 없는 DB입니다. 명시적인 production DB adoption 절차가 필요합니다.');
   const required=['settings','participants','programs','program_runs','sessions','applications','attendance','staff_users','auth_sessions'];
   if(applicationId&&applicationId!==APPLICATION_ID)throw new Error('다른 애플리케이션의 SQLite 파일은 열 수 없습니다.');
   if(storedEnvironment&&storedEnvironment!==environment)throw new Error(`${storedEnvironment} DB를 ${environment} 환경에서 열 수 없습니다.`);
-  if(applicationId===APPLICATION_ID&&storedEnvironment===environment){
-    const missing=required.filter(table=>!tables.has(table));
-    if(missing.length)throw new Error(`Onmaeum DB 필수 테이블이 누락되었습니다: ${missing.join(', ')}`);
-    return false;
-  }
-  if(environment!=='production')return false;
-  if(!allowProductionAdoption)throw new Error('기존 marker 없는 DB입니다. 경로와 백업을 확인한 뒤 명시적인 production DB adoption 절차를 수행하세요.');
+  const tables=new Set((db.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as {name:string}[]).map(row=>row.name));
   const missing=required.filter(table=>!tables.has(table));
-  if(missing.length)throw new Error(`기존 DB를 adoption할 수 없습니다. 필수 테이블이 누락되었습니다: ${missing.join(', ')}`);
-  return true;
+  if(missing.length)throw new Error(`Onmaeum DB 필수 테이블이 누락되었습니다: ${missing.join(', ')}`);
 }
 
 function writeDatabaseMarkers(db:DatabaseSync,environment:DatabaseEnvironment) {
@@ -118,178 +131,33 @@ function writeDatabaseMarkers(db:DatabaseSync,environment:DatabaseEnvironment) {
   set.run('database_initialized_at',new Date().toISOString());
 }
 
-function ensureDatabase(db: DatabaseSync,options:{allowInitialAdministrator:boolean;migrateUsrAdmin:boolean}) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS participants (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      gender TEXT NOT NULL DEFAULT '미입력',
-      age INTEGER NOT NULL DEFAULT 0,
-      phone TEXT NOT NULL DEFAULT '',
-      member_status TEXT NOT NULL DEFAULT '비회원',
-      note TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS programs (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      category TEXT NOT NULL,
-      delivery_type TEXT NOT NULL DEFAULT '집단',
-      session_count INTEGER NOT NULL DEFAULT 1,
-      recurrence TEXT NOT NULL DEFAULT '매주',
-      location TEXT NOT NULL DEFAULT '',
-      manager TEXT NOT NULL DEFAULT '',
-      capacity INTEGER NOT NULL DEFAULT 10,
-      status TEXT NOT NULL DEFAULT '운영 중',
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS program_runs (
-      id TEXT PRIMARY KEY,
-      program_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
-      round_number INTEGER NOT NULL,
-      label TEXT NOT NULL,
-      start_date TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT '모집 중',
-      UNIQUE(program_id, round_number)
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      run_id TEXT NOT NULL REFERENCES program_runs(id) ON DELETE CASCADE,
-      session_number INTEGER NOT NULL,
-      session_date TEXT NOT NULL,
-      session_time TEXT NOT NULL,
-      location TEXT NOT NULL,
-      UNIQUE(run_id, session_number)
-    );
-    CREATE TABLE IF NOT EXISTS applications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-      program_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
-      run_id TEXT REFERENCES program_runs(id) ON DELETE SET NULL,
-      applied_at TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT '신청',
-      UNIQUE(participant_id, program_id)
-    );
-    CREATE TABLE IF NOT EXISTS attendance (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
-      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      status TEXT NOT NULL DEFAULT '미입력',
-      note TEXT NOT NULL DEFAULT '',
-      UNIQUE(application_id, session_id)
-    );
-    CREATE TABLE IF NOT EXISTS certificates (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      participant_id TEXT NOT NULL REFERENCES participants(id),
-      issued_at TEXT NOT NULL,
-      session_count INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      created_at TEXT NOT NULL,
-      actor TEXT NOT NULL,
-      action TEXT NOT NULL,
-      entity_type TEXT NOT NULL,
-      entity_id TEXT NOT NULL,
-      before_json TEXT NOT NULL DEFAULT '',
-      after_json TEXT NOT NULL DEFAULT '',
-      summary TEXT NOT NULL DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS staff_users (
-      id TEXT PRIMARY KEY,
-      username TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL,
-      pin_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT '일반 담당자',
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS auth_sessions (
-      token TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL REFERENCES staff_users(id) ON DELETE CASCADE,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS assessment_catalog (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE,
-      min_score INTEGER NOT NULL DEFAULT 0,
-      max_score INTEGER NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS program_assessments (
-      program_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
-      assessment_id TEXT NOT NULL REFERENCES assessment_catalog(id) ON DELETE CASCADE,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY(program_id, assessment_id)
-    );
-    CREATE TABLE IF NOT EXISTS assessment_scores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
-      assessment_id TEXT NOT NULL REFERENCES assessment_catalog(id) ON DELETE CASCADE,
-      pre_score REAL,
-      post_score REAL,
-      note TEXT NOT NULL DEFAULT '',
-      updated_at TEXT NOT NULL,
-      UNIQUE(application_id, assessment_id)
-    );
-    CREATE TABLE IF NOT EXISTS satisfaction_surveys (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      application_id INTEGER NOT NULL UNIQUE REFERENCES applications(id) ON DELETE CASCADE,
-      score INTEGER,
-      comment TEXT NOT NULL DEFAULT '',
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS schedule_events (
-      id TEXT PRIMARY KEY,
-      event_type TEXT NOT NULL DEFAULT '상담',
-      color TEXT NOT NULL DEFAULT 'green',
-      participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-      title TEXT NOT NULL,
-      event_date TEXT NOT NULL,
-      all_day INTEGER NOT NULL DEFAULT 0,
-      start_time TEXT NOT NULL DEFAULT '',
-      end_time TEXT NOT NULL DEFAULT '',
-      recurrence TEXT NOT NULL DEFAULT '1회',
-      delivery_mode TEXT NOT NULL DEFAULT '대면',
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_participants_name ON participants(name);
-    CREATE INDEX IF NOT EXISTS idx_runs_program ON program_runs(program_id, round_number);
-    CREATE INDEX IF NOT EXISTS idx_sessions_run_date ON sessions(run_id, session_date);
-    CREATE INDEX IF NOT EXISTS idx_applications_participant ON applications(participant_id);
-    CREATE INDEX IF NOT EXISTS idx_applications_run ON applications(run_id);
-    CREATE INDEX IF NOT EXISTS idx_attendance_application ON attendance(application_id);
-    CREATE INDEX IF NOT EXISTS idx_attendance_session ON attendance(session_id);
-    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id);
-    CREATE INDEX IF NOT EXISTS idx_auth_user ON auth_sessions(user_id, expires_at);
-    CREATE INDEX IF NOT EXISTS idx_scores_application ON assessment_scores(application_id);
-    CREATE INDEX IF NOT EXISTS idx_schedule_events_date ON schedule_events(event_date, start_time);
-    CREATE INDEX IF NOT EXISTS idx_schedule_events_participant ON schedule_events(participant_id);
-  `);
-  migrateApplications(db);
-  migrateOperations(db);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_applications_program ON applications(program_id)');
+function bootstrapBaselineData(db:DatabaseSync){
   const center = db.prepare('SELECT value FROM settings WHERE key = ?').get('center_name');
   if (!center) {
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('center_name', '마음봄 정신건강복지센터');
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('manager_name', '프로그램 담당자');
   }
   const seedDate=new Date().toISOString().slice(0,10);
-  bootstrapInitialAdministrator(db,seedDate,options);
   const insertAssessment=db.prepare('INSERT OR IGNORE INTO assessment_catalog (id,name,min_score,max_score,active,created_at) VALUES (?,?,?,?,1,?)');
   insertAssessment.run('ASM-PHQ9','PHQ-9',0,27,seedDate);
   insertAssessment.run('ASM-GAD7','GAD-7',0,21,seedDate);
   insertAssessment.run('ASM-PSS10','PSS-10',0,40,seedDate);
-  const count = db.prepare('SELECT COUNT(*) AS count FROM participants').get() as { count:number };
-  if (process.env.NODE_ENV !== 'production' && process.env.ONMAEUM_ENABLE_DEMO_SEED === '1' && !count.count) seedDatabase(db);
-  db.exec('PRAGMA optimize');
+}
+
+function validateActiveAdministrator(db:DatabaseSync){
+  const administrators=(db.prepare("SELECT COUNT(*) AS count FROM staff_users WHERE role='관리자' AND active=1").get() as {count:number}).count;
+  if(administrators<1)throw new Error('An active production administrator is required.');
+}
+
+function validateBaselineData(db:DatabaseSync){
+  for(const key of ['center_name','manager_name'])if(!marker(db,key)?.trim())throw new Error(`Required production setting is missing: ${key}.`);
+  const assessments=(db.prepare("SELECT COUNT(*) AS count FROM assessment_catalog WHERE id IN ('ASM-PHQ9','ASM-GAD7','ASM-PSS10')").get() as {count:number}).count;
+  if(assessments!==3)throw new Error('Required baseline assessment catalog entries are missing.');
+}
+
+function rejectUnreviewedLegacyAdministrator(db:DatabaseSync){
+  const legacy=db.prepare('SELECT id FROM staff_users WHERE id=?').get('USR-ADMIN');
+  if(legacy&&marker(db,'usr_admin_migration_completed')!=='1')throw new Error('기존 USR-ADMIN 계정이 발견되었습니다. 백업 후 명시적인 USR-ADMIN migration 절차를 수행하세요.');
 }
 
 function bootstrapCredentials() {
@@ -323,49 +191,113 @@ function bootstrapInitialAdministrator(db:DatabaseSync,createdAt:string,options:
   db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,pin_changed_at,must_change_pin) VALUES (?,?,?,?,?,1,?,NULL,1)').run(`USR-${randomUUID()}`,username,displayName,hashPin(username,pin),'관리자',createdAt);
 }
 
-function ensureColumn(db:DatabaseSync,table:string,column:string,definition:string) {
-  const columns=db.prepare(`PRAGMA table_info(${table})`).all() as {name:string}[];
-  if(!columns.some(item=>item.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+function assertProductionDatabasePath(){
+  if(databaseEnvironment()!=='production')throw new Error('Production database maintenance requires NODE_ENV=production.');
+  const filePath=getDatabasePath();
+  if(/^(\\\\|\/\/)/.test(filePath))throw new Error('운영 SQLite DB는 네트워크 공유 경로에 둘 수 없습니다.');
+  return filePath;
 }
 
-function migrateOperations(db:DatabaseSync) {
-  ensureColumn(db,'program_runs','closed_at','TEXT');
-  ensureColumn(db,'program_runs','closed_by','TEXT');
-  ensureColumn(db,'sessions','attendance_status',"TEXT NOT NULL DEFAULT '작성 중'");
-  ensureColumn(db,'sessions','attendance_closed_at','TEXT');
-  ensureColumn(db,'sessions','attendance_closed_by','TEXT');
-  ensureColumn(db,'sessions','reopen_reason',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'applications','queue_number','INTEGER');
-  ensureColumn(db,'applications','status_reason',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'applications','status_updated_at',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'applications','assigned_at','TEXT');
-  ensureColumn(db,'attendance','contacted_at','TEXT');
-  ensureColumn(db,'attendance','makeup_for_session_id','TEXT');
-  ensureColumn(db,'assessment_catalog','version',"TEXT NOT NULL DEFAULT '1.0'");
-  ensureColumn(db,'assessment_catalog','description',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'assessment_scores','pre_date','TEXT');
-  ensureColumn(db,'assessment_scores','post_date','TEXT');
-  ensureColumn(db,'assessment_scores','not_completed_reason',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'assessment_scores','assessor',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'satisfaction_surveys','survey_version',"TEXT NOT NULL DEFAULT '1.0'");
-  ensureColumn(db,'satisfaction_surveys','anonymous','INTEGER NOT NULL DEFAULT 0');
-  ensureColumn(db,'staff_users','failed_attempts','INTEGER NOT NULL DEFAULT 0');
-  ensureColumn(db,'staff_users','locked_until','TEXT');
-  ensureColumn(db,'staff_users','last_login_at','TEXT');
-  ensureColumn(db,'staff_users','pin_changed_at','TEXT');
-  ensureColumn(db,'staff_users','must_change_pin','INTEGER NOT NULL DEFAULT 0');
-  ensureColumn(db,'auth_sessions','last_seen_at','TEXT');
-  ensureColumn(db,'auth_sessions','ip_address',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'audit_logs','ip_address',"TEXT NOT NULL DEFAULT ''");
-  ensureColumn(db,'audit_logs','reason',"TEXT NOT NULL DEFAULT ''");
-  const applications=db.prepare(`SELECT id,program_id,applied_at FROM applications WHERE queue_number IS NULL ORDER BY program_id,applied_at,id`).all() as {id:number;program_id:string}[];
-  const counters=new Map<string,number>();
-  for(const row of db.prepare(`SELECT program_id,COALESCE(MAX(queue_number),0) AS max_queue FROM applications WHERE queue_number IS NOT NULL GROUP BY program_id`).all() as {program_id:string;max_queue:number}[])counters.set(row.program_id,row.max_queue);
-  const update=db.prepare('UPDATE applications SET queue_number=?,status_updated_at=CASE WHEN status_updated_at=\'\' THEN applied_at ELSE status_updated_at END WHERE id=?');
-  for(const application of applications){const next=(counters.get(application.program_id)||0)+1;counters.set(application.program_id,next);update.run(next,application.id)}
-  db.exec('CREATE INDEX IF NOT EXISTS idx_applications_workflow ON applications(status,run_id,applied_at)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_attendance_status ON sessions(attendance_status,session_date)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_users_locked ON staff_users(active,locked_until)');
+function integrityCheck(db:DatabaseSync){
+  const rows=db.prepare('PRAGMA integrity_check').all() as {integrity_check:string}[];
+  if(rows.length!==1||rows[0].integrity_check!=='ok')throw new Error('SQLite integrity_check failed.');
+}
+
+function validateProductionJournalMode(db:DatabaseSync){
+  const journalMode=String((db.prepare('PRAGMA journal_mode').get() as {journal_mode:string}).journal_mode).toLowerCase();
+  if(journalMode!=='delete')throw new Error(`Production SQLite journal_mode must be DELETE; found ${journalMode}.`);
+}
+
+function validateProductionState(db:DatabaseSync,{integrity=false,allowLegacyAdministrator=false}:{integrity?:boolean;allowLegacyAdministrator?:boolean}={}){
+  if(integrity)integrityCheck(db);
+  validateProductionJournalMode(db);
+  const schema=validateLatestSchema(db);
+  validateDatabaseIdentity(db,'production');
+  validateActiveAdministrator(db);
+  validateBaselineData(db);
+  if(!allowLegacyAdministrator)rejectUnreviewedLegacyAdministrator(db);
+  return schema;
+}
+
+export function validateProductionDatabaseReadOnly(){
+  const filePath=assertProductionDatabasePath();
+  if(!existsSync(filePath))throw new Error('운영 DB 파일이 존재하지 않습니다.');
+  const db=new DatabaseSync(filePath,{readOnly:true});
+  try {
+    db.exec('PRAGMA query_only = ON');
+    db.exec('PRAGMA foreign_keys = ON');
+    const schema=validateProductionState(db,{integrity:true});
+    return {...schema,integrity:'ok' as const,productionMarker:true as const,activeAdministrator:true as const};
+  } finally {db.close()}
+}
+
+export function adoptProductionDatabaseExplicitly(){
+  const filePath=assertProductionDatabasePath();
+  if(!existsSync(filePath))throw new Error('adopt 대상 운영 DB 파일이 존재하지 않습니다.');
+  const db=new DatabaseSync(filePath);
+  try {
+    configureConnection(db);
+    integrityCheck(db);
+    const tables=new Set((db.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as {name:string}[]).map(row=>row.name));
+    if(!tables.has('settings'))throw new Error('지정한 파일은 Onmaeum DB로 확인되지 않습니다.');
+    const applicationId=marker(db,'application_id'),storedEnvironment=marker(db,'database_environment');
+    if(applicationId&&applicationId!==APPLICATION_ID)throw new Error('다른 애플리케이션의 SQLite 파일은 adopt할 수 없습니다.');
+    if(storedEnvironment&&storedEnvironment!=='production')throw new Error(`${storedEnvironment} DB를 production 환경에서 열 수 없습니다. adopt를 거부했습니다.`);
+    const version=Number((db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version);
+    const schema=version===CURRENT_SCHEMA_VERSION?validateLatestSchema(db):{version,profile:classifyKnownV0Schema(db),fingerprint:schemaFingerprint(db)};
+    validateActiveAdministrator(db);
+    withImmediateTransaction(db,()=>writeDatabaseMarkers(db,'production'));
+    return {...schema,adopted:true as const};
+  } finally {db.close()}
+}
+
+export function migrateLegacyAdministratorExplicitly(){
+  const filePath=assertProductionDatabasePath();
+  if(!existsSync(filePath))throw new Error('USR-ADMIN migration 대상 운영 DB 파일이 존재하지 않습니다.');
+  const db=new DatabaseSync(filePath);
+  try {
+    configureConnection(db);
+    validateProductionState(db,{integrity:true,allowLegacyAdministrator:true});
+    bootstrapInitialAdministrator(db,new Date().toISOString().slice(0,10),{allowInitialAdministrator:false,migrateUsrAdmin:true});
+    validateProductionState(db,{integrity:true});
+    if(marker(db,'usr_admin_migration_completed')!=='1')throw new Error('USR-ADMIN migration completion marker is missing.');
+    return {migrated:true as const};
+  } finally {db.close()}
+}
+
+export async function migrateProductionSchemaExplicitly(){
+  const filePath=assertProductionDatabasePath();
+  if(!existsSync(filePath))throw new Error('migrate-schema 대상 운영 DB 파일이 존재하지 않습니다.');
+  mkdirSync(getBackupDirectory(),{recursive:true});
+  const db=new DatabaseSync(filePath);
+  let safetyPath='';
+  try {
+    configureConnection(db);
+    integrityCheck(db);
+    validateProductionJournalMode(db);
+    validateDatabaseIdentity(db,'production');
+    validateActiveAdministrator(db);
+    validateBaselineData(db);
+    const version=Number((db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version);
+    if(version===CURRENT_SCHEMA_VERSION){
+      const schema=validateLatestSchema(db);
+      return {...schema,alreadyCurrent:true as const,safetyBackup:null};
+    }
+    if(version>CURRENT_SCHEMA_VERSION)throw new Error(`Database schema version ${version} is newer than application version ${CURRENT_SCHEMA_VERSION}; downgrade is refused.`);
+    const profile=classifyKnownV0Schema(db),beforeFingerprint=schemaFingerprint(db);
+    const extension=path.extname(filePath)||'.sqlite';
+    safetyPath=path.join(getBackupDirectory(),`${path.basename(filePath,extension)}-backup-before-schema-v${CURRENT_SCHEMA_VERSION}-${Date.now()}${extension}`);
+    await backup(db,safetyPath);
+    const safety=new DatabaseSync(safetyPath,{readOnly:true});
+    try {
+      integrityCheck(safety);
+      const safetyVersion=Number((safety.prepare('PRAGMA user_version').get() as {user_version:number}).user_version);
+      if(safetyVersion!==0||schemaFingerprint(safety)!==beforeFingerprint)throw new Error('Schema migration safety backup verification failed.');
+    } finally {safety.close()}
+    const migrated=migrateKnownV0Schema(db);
+    validateProductionState(db,{allowLegacyAdministrator:true});
+    return {...migrated,profile,safetyBackup:path.basename(safetyPath),alreadyCurrent:false as const};
+  } finally {db.close()}
 }
 
 function seedDatabase(db: DatabaseSync) {
@@ -395,41 +327,6 @@ function seedDatabase(db: DatabaseSync) {
   insertApplication.run('P-2026-0003','PRG-001',null,'2026-08-20','신청');
   insertApplication.run('P-2026-0001','PRG-002','RUN-PRG-002-1','2026-08-01','참가중');
   insertApplication.run('P-2026-0004','PRG-003','RUN-PRG-003-1','2026-08-03','참가대기');
-}
-
-function migrateApplications(db:DatabaseSync) {
-  const columns = db.prepare('PRAGMA table_info(applications)').all() as {name:string}[];
-  if (!columns.some(column=>column.name==='program_id')) {
-    db.exec('PRAGMA foreign_keys = OFF');
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      db.exec(`CREATE TABLE applications_new (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
-        program_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
-        run_id TEXT REFERENCES program_runs(id) ON DELETE SET NULL,
-        applied_at TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT '신청',
-        UNIQUE(participant_id, program_id)
-      )`);
-      db.exec(`INSERT INTO applications_new (id,participant_id,program_id,run_id,applied_at,status)
-        SELECT a.id,a.participant_id,r.program_id,a.run_id,a.applied_at,
-          CASE WHEN a.status IN ('승인','대기') THEN '참가대기' ELSE a.status END
-        FROM applications a JOIN program_runs r ON r.id=a.run_id`);
-      db.exec('DROP TABLE applications');
-      db.exec('ALTER TABLE applications_new RENAME TO applications');
-      db.exec('CREATE INDEX idx_applications_participant ON applications(participant_id)');
-      db.exec('CREATE INDEX idx_applications_program ON applications(program_id)');
-      db.exec('CREATE INDEX idx_applications_run ON applications(run_id)');
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    } finally {
-      db.exec('PRAGMA foreign_keys = ON');
-    }
-  }
-  db.exec(`UPDATE applications SET status='참가대기' WHERE status IN ('승인','대기')`);
 }
 
 export function createRun(db: DatabaseSync, programId:string, roundNumber:number, label:string, startDate:string, time:string) {
