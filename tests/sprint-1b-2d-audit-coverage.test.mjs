@@ -66,7 +66,8 @@ test('core lifecycle and import mutations record canonical minimized audits',()=
     assert.equal(importResponse.status,200);assert.equal(auditRows('import_complete').length,importAuditCount+1);
     const importAudit=lastAudit('import_complete'),importAfter=JSON.parse(importAudit.after_json);
     assert.equal(importAudit.entity_type,'가져오기');assert.match(importAudit.entity_id,/^IMPORT-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-    assert.deepEqual(importAfter,{processed_count:4,participant_created_count:2,participant_updated_count:0,application_created_count:1,application_updated_count:1,duplicate_count:1,rejected_count:2});
+    assert.deepEqual(importAfter,{processed_count:4,participant_created_count:1,participant_updated_count:0,application_created_count:1,application_updated_count:1,duplicate_count:1,rejected_count:2});
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM participants WHERE name=?').get('NOTE_SECRET 미배정').count,0);
     assert.equal(db.prepare('SELECT status FROM applications WHERE participant_id=? AND program_id=?').get('P-IMPORT-EXISTING',program.id).status,'신청');
 
     const allAudit=JSON.stringify(db.prepare('SELECT actor,action,entity_type,entity_id,before_json,after_json,summary,reason,ip_address FROM audit_logs').all());
