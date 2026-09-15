@@ -1,8 +1,9 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import { createRun, getBackupDirectory, getDatabase, getDatabasePath, hashPin, verifyPin, withImmediateTransaction } from '../../../db/index.ts';
-import { createVerifiedBackup, listBackupArtifacts, resolveBackupBasename, verifyBackupArtifact } from '../../../db/backup-management.ts';
-import { attendanceOnlySnapshot, canPerformAction, createAuthSession, expiredSessionCookie, getAuthenticatedUser, invalidateAuthSession, sessionCookie, validateMutationRequest, type SafeUser } from '../../../lib/security.ts';
+import { createRun, getBackupDirectory, getDatabase, getDatabasePath, hashPin, markDatabaseUnusable, verifyPin, withImmediateTransaction } from '../../../db/index.ts';
+import { createVerifiedBackup, listBackupArtifacts, verifyBackupArtifact } from '../../../db/backup-management.ts';
+import { closeRestoreCandidate, openRestoreCandidate, restoreBusinessData, reverifyRestoreCandidate } from '../../../db/restore-management.ts';
+import { attendanceOnlySnapshot, canPerformAction, createAuthSession, expiredSessionCookie, getAuthenticatedUser, getAuthenticatedUserReadOnly, invalidateAuthSession, sessionCookie, validateMutationRequest, type SafeUser } from '../../../lib/security.ts';
 import { inclusiveCalendarDays, isCanonicalCalendarDate } from '../../../lib/schedule-state.ts';
 
 export const runtime = 'nodejs';
@@ -69,7 +70,7 @@ function logChange(db:DatabaseSync, action:string, entityType:string, entityId:s
   db.prepare('INSERT INTO audit_logs (created_at,actor,action,entity_type,entity_id,before_json,after_json,summary,reason,ip_address) VALUES (?,?,?,?,?,?,?,?,?,?)').run(createdAt,requestedActor?.trim()||'SYSTEM',action,entityType,String(entityId),safeBefore?JSON.stringify(safeBefore):'',safeAfter?JSON.stringify(safeAfter):'',summary.slice(0,200),reason.slice(0,200),ipAddress);
 }
 function backupFiles() { return listBackupArtifacts(getDatabasePath(),getBackupDirectory()); }
-function backupFailure(code:'backup_creation_failed'|'backup_verification_failed'|'backup_restore_preflight_failed',error:unknown):never { console.error(`[api/data] ${code}`,error);throw new ActionError(code); }
+function backupFailure(code:'backup_creation_failed'|'backup_verification_failed'|'backup_restore_preflight_failed'|'backup_restore_failed',error:unknown):never { console.error(`[api/data] ${code}`,error);throw new ActionError(code); }
 
 function staffSnapshot(currentUser:SafeUser) {
   const settings=Object.fromEntries((rows(`SELECT key,value FROM settings WHERE key='center_name'`) as {key:string;value:string}[]).map(item=>[item.key,item.value]));
@@ -242,9 +243,9 @@ async function handlePOST(request:Request) {
       });
       const safeUser:SafeUser={id:user.id,username:user.username,display_name:user.display_name,role:user.role,active:user.active,must_change_pin:user.must_change_pin,last_login_at:nowIso};const response=Response.json(snapshot(safeUser));response.headers.append('Set-Cookie',sessionCookie(secret));return response;
     }
-    const user=getAuthenticatedUser(request,db);
+    const action=text(body.action),user=action==='restoreBackup'?getAuthenticatedUserReadOnly(request,db):getAuthenticatedUser(request,db);
     if(!user)return loginRequired('로그인이 만료되었습니다.');
-    const action=text(body.action);if(user.must_change_pin&&!['changeMyPin','logout'].includes(action))return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!canPerformAction(user,action))return Response.json({error:`${user.role} 권한으로는 이 작업을 수행할 수 없습니다.`},{status:403});
+    if(user.must_change_pin&&!['changeMyPin','logout'].includes(action))return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!canPerformAction(user,action))return Response.json({error:`${user.role} 권한으로는 이 작업을 수행할 수 없습니다.`},{status:403});
     let responseWarning='';
     let updatedApplicationReason:{applicationId:number;reasonPresent:boolean;statusReason:string}|undefined;
     let invalidateCurrentSession=false;
@@ -442,26 +443,17 @@ async function handlePOST(request:Request) {
       logChange(db,'백업 점검','데이터베이스',basename,null,{backup_file:basename,purpose:artifact.purpose,verified:true},'백업 파일 무결성 점검',user.id,'',requestIp(request));
       return Response.json({...snapshot(user),backupCheck:result});
     } else if (body.action === 'restoreBackup') {
-      const restoreBasename=text(body.basename);let restorePath;try {const artifact=verifyBackupArtifact(getDatabasePath(),getBackupDirectory(),restoreBasename);if(!['manual','restore_safety'].includes(artifact.purpose))throw new Error('Backup purpose is not restore-compatible.');restorePath=resolveBackupBasename(getDatabasePath(),getBackupDirectory(),restoreBasename);}catch(error){backupFailure('backup_restore_preflight_failed',error)}
-      let safety;try {safety=await createVerifiedBackup(db,{sourceDatabasePath:getDatabasePath(),backupDirectory:getBackupDirectory(),purpose:'restore_safety'});}catch(error){backupFailure('backup_creation_failed',error)}
-      const candidate=new DatabaseSync(restorePath,{readOnly:true});
-      const tables=['settings','participants','programs','program_runs','sessions','applications','attendance','certificates'];
-      const candidateTables=new Set((candidate.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as {name:string}[]).map(row=>row.name));
-      const outcomeTables=['assessment_catalog','program_assessments','assessment_scores','satisfaction_surveys'].filter(table=>candidateTables.has(table));
-      const optionalTables=['schedule_events'].filter(table=>candidateTables.has(table));
-      db.exec('BEGIN IMMEDIATE');
+      const restoreBasename=text(body.basename),databasePath=getDatabasePath(),backupDirectory=getBackupDirectory();
+      let candidate;try {candidate=openRestoreCandidate(databasePath,backupDirectory,restoreBasename);}catch(error){backupFailure('backup_restore_preflight_failed',error)}
       try {
-        db.exec('DELETE FROM schedule_events;');
-        db.exec('DELETE FROM satisfaction_surveys; DELETE FROM assessment_scores; DELETE FROM program_assessments;');
-        if(outcomeTables.includes('assessment_catalog'))db.exec('DELETE FROM assessment_catalog');
-        for(const table of [...tables].reverse()) db.exec(`DELETE FROM ${table}`);
-        for(const table of tables){const sourceRows=candidate.prepare(`SELECT * FROM ${table}`).all() as Record<string,SQLInputValue>[];if(!sourceRows.length)continue;const columns=Object.keys(sourceRows[0]);const insert=db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`);for(const row of sourceRows)insert.run(...columns.map(column=>row[column]));}
-        for(const table of outcomeTables){const sourceRows=candidate.prepare(`SELECT * FROM ${table}`).all() as Record<string,SQLInputValue>[];if(!sourceRows.length)continue;const columns=Object.keys(sourceRows[0]);const insert=db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`);for(const row of sourceRows)insert.run(...columns.map(column=>row[column]));}
-        for(const table of optionalTables){const sourceRows=candidate.prepare(`SELECT * FROM ${table}`).all() as Record<string,SQLInputValue>[];if(!sourceRows.length)continue;const columns=Object.keys(sourceRows[0]);const insert=db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`);for(const row of sourceRows)insert.run(...columns.map(column=>row[column]));}
-        logChange(db,'복원','데이터베이스',restoreBasename,{safety_backup:safety.artifact.basename},{restored_from:restoreBasename},`백업 복원 완료 · 복원 전 안전 백업 생성`,user.id,'',requestIp(request));
-        db.exec('COMMIT');
-      } catch(error){db.exec('ROLLBACK');throw error;} finally {candidate.close();}
-      return Response.json({...snapshot(user),restoreMessage:'복원 완료 · 복원 전 안전 백업을 생성했습니다.',warning:safety.retentionWarnings.length?'retention_cleanup_failed':undefined});
+        let safety;try {safety=await createVerifiedBackup(db,{sourceDatabasePath:databasePath,backupDirectory,purpose:'restore_safety'});}catch(error){backupFailure('backup_creation_failed',error)}
+        const restoreUser=getAuthenticatedUserReadOnly(request,db);if(!restoreUser||restoreUser.must_change_pin||!canPerformAction(restoreUser,'restoreBackup'))return loginRequired('로그인이 만료되었습니다.');
+        try {reverifyRestoreCandidate(candidate);}catch(error){backupFailure('backup_restore_preflight_failed',error)}
+        try {
+          restoreBusinessData({targetDb:db,sourceDb:candidate.db,onRollbackFailure:markDatabaseUnusable,writeAudit:summary=>logChange(db,'복원','데이터베이스',restoreBasename,null,{candidate_basename:restoreBasename,purpose:candidate.artifact.purpose,safety_backup_basename:safety.artifact.basename,restored_table_count:summary.restoredTableCount},'백업 복원 완료 · 복원 전 안전 백업 생성',restoreUser.id,'',requestIp(request))});
+        } catch(error){backupFailure('backup_restore_failed',error)}
+        return clearSessionCookie(Response.json({success:true,reloginRequired:true,loginRequired:true,candidateBasename:restoreBasename,safetyBackupBasename:safety.artifact.basename,restoreMessage:'복원 완료 · 보안을 위해 다시 로그인하세요.',warning:safety.retentionWarnings.length?'retention_cleanup_failed':undefined}));
+      } finally {closeRestoreCandidate(candidate);}
     } else if (body.action === 'certificate') {
       const participant=db.prepare('SELECT id FROM participants WHERE id=?').get(text(body.participantId)) as {id:string}|undefined,sessionCount=Number(body.sessionCount);
       if(!participant||!Number.isInteger(sessionCount)||sessionCount<1)throw new ActionError('참가자와 참여 회기 수를 올바르게 입력하세요.');

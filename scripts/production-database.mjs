@@ -1,9 +1,10 @@
 const arguments_=process.argv.slice(2),requestedModes=new Set(arguments_);
-const supportedModes=new Set(['initialize','adopt','migrate','migrate-schema','validate','check-backup']);
+const supportedModes=new Set(['initialize','adopt','migrate','migrate-schema','validate','check-backup','restore-drill']);
 const {existsSync,rmSync}=await import('node:fs');
 
 const checkBackup=arguments_[0]==='check-backup';
-if(!requestedModes.size||checkBackup&&arguments_.length!==2||!checkBackup&&[...requestedModes].some(mode=>!supportedModes.has(mode))||requestedModes.has('validate')&&requestedModes.size!==1||requestedModes.has('initialize')&&requestedModes.size!==1||requestedModes.has('migrate-schema')&&requestedModes.size!==1){
+const restoreDrill=arguments_[0]==='restore-drill',artifactCommand=checkBackup||restoreDrill;
+if(!requestedModes.size||artifactCommand&&arguments_.length!==2||!artifactCommand&&[...requestedModes].some(mode=>!supportedModes.has(mode))||requestedModes.has('validate')&&requestedModes.size!==1||requestedModes.has('initialize')&&requestedModes.size!==1||requestedModes.has('migrate-schema')&&requestedModes.size!==1){
   console.error('Production database command is invalid.');
   process.exit(2);
 }
@@ -33,6 +34,9 @@ try {
   if(checkBackup){
     const {verifyBackupArtifact}=await import('../db/backup-management.ts');
     result=verifyBackupArtifact(databasePath,getBackupDirectory(),arguments_[1]);
+  } else if(restoreDrill){
+    const {runRestoreDrill}=await import('../db/restore-management.ts');
+    result=runRestoreDrill(databasePath,getBackupDirectory(),arguments_[1]);
   } else if(requestedModes.has('validate'))result=validateProductionDatabaseReadOnly();
   else if(requestedModes.has('migrate-schema'))result=await migrateProductionSchemaExplicitly();
   else if(requestedModes.has('initialize')){
@@ -45,13 +49,14 @@ try {
     const adoptedKnownV0=requestedModes.has('adopt')&&!requestedModes.has('migrate')&&result?.version===0;
     if(!adoptedKnownV0)result={...(result||{}),...validateProductionDatabaseReadOnly()};
   }
-  console.log(JSON.stringify({ok:true,operation:[...requestedModes].join('+'),...result}));
+  console.log(JSON.stringify({ok:true,operation:artifactCommand?arguments_[0]:[...requestedModes].join('+'),...result}));
 } catch(error) {
   if(requestedModes.has('initialize')&&!databaseExisted&&databasePath){
     try { db?.close(); } catch {}
     rmSync(databasePath,{force:true});
     rmSync(`${databasePath}-journal`,{force:true});
   }
-  console.error(`Production database command failed: ${error instanceof Error?error.message:'Unknown error'}`);
+  if(restoreDrill)console.error(JSON.stringify({ok:false,operation:'restore-drill',success:false,error:'restore_drill_failed'}));
+  else console.error(`Production database command failed: ${error instanceof Error?error.message:'Unknown error'}`);
   process.exitCode=1;
 }

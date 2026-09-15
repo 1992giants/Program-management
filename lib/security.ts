@@ -72,13 +72,27 @@ export function validateMutationRequest(request:Request) {
   return undefined;
 }
 
-export function getAuthenticatedUser(request:Request,db:DatabaseSync) {
+function readAuthenticatedUser(request:Request,db:DatabaseSync) {
   const secret=sessionSecret(request);
   if(!secret)return undefined;
   const token=sessionTokenDigest(secret);
   const now=new Date().toISOString();
   const row=db.prepare(`SELECT u.id,u.username,u.display_name,u.role,u.active,u.must_change_pin,u.last_login_at,s.expires_at FROM auth_sessions s JOIN staff_users u ON u.id=s.user_id WHERE s.token=?`).get(token) as (SafeUser&{expires_at:string})|undefined;
   if(!row)return undefined;
+  return {token,row,now};
+}
+
+export function getAuthenticatedUserReadOnly(request:Request,db:DatabaseSync) {
+  const authentication=readAuthenticatedUser(request,db);
+  if(!authentication||!authentication.row.active||authentication.row.expires_at<=authentication.now)return undefined;
+  const {row}=authentication;
+  return {id:row.id,username:row.username,display_name:row.display_name,role:row.role,active:row.active,must_change_pin:row.must_change_pin,last_login_at:row.last_login_at};
+}
+
+export function getAuthenticatedUser(request:Request,db:DatabaseSync) {
+  const authentication=readAuthenticatedUser(request,db);
+  if(!authentication)return undefined;
+  const {token,row,now}=authentication;
   if(!row.active||row.expires_at<=now){db.prepare('DELETE FROM auth_sessions WHERE token=?').run(token);return undefined;}
   db.prepare('UPDATE auth_sessions SET last_seen_at=? WHERE token=?').run(now,token);
   return {id:row.id,username:row.username,display_name:row.display_name,role:row.role,active:row.active,must_change_pin:row.must_change_pin,last_login_at:row.last_login_at};

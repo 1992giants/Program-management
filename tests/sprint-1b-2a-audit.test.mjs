@@ -122,7 +122,7 @@ test('감사로그는 관리자 전용이며 민감 원문과 credential을 복�
     const restoreResponse=await post({action:'restoreBackup',basename:backupBody.backup.basename},admin.cookie);
     assert.equal(restoreResponse.status,200);
     const restoreLog=auditRow('복원','데이터베이스'),restoreText=auditText(restoreLog);
-    assert.equal(JSON.parse(restoreLog.after_json).restored_from,backupBody.backup.basename);
+    assert.equal(JSON.parse(restoreLog.after_json).candidate_basename,backupBody.backup.basename);
 
     const allAudit=JSON.stringify(db.prepare('SELECT actor,before_json,after_json,summary,reason FROM audit_logs').all());
     for(const secret of ['86420975','75310864','24681357',admin.cookie.slice(SESSION_COOKIE_NAME.length+1),staff.cookie.slice(SESSION_COOKIE_NAME.length+1),attendance.cookie.slice(SESSION_COOKIE_NAME.length+1)])assert.equal(allAudit.includes(secret),false);

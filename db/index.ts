@@ -8,7 +8,14 @@ import { createVerifiedBackup } from './backup-management.ts';
 export { CURRENT_SCHEMA_VERSION } from './schema-management.ts';
 
 let database: DatabaseSync | null = null;
+let fatalDatabaseState:Error|null=null;
 const APPLICATION_ID='onmaeum-program-care';
+
+export function markDatabaseUnusable(error:unknown){
+  fatalDatabaseState=new Error('Database state is uncertain; process restart is required.',{cause:error});
+  console.error('[database] marked unusable',error);
+  try {database?.close();}catch(closeError){console.error('[database] close after fatal state failed',closeError);}
+}
 
 export function withImmediateTransaction<T>(db:DatabaseSync,fn:()=>T):T {
   db.exec('BEGIN IMMEDIATE');
@@ -56,6 +63,7 @@ export function getStorageInfo() {
 }
 
 export function getDatabase() {
+  if(fatalDatabaseState)throw fatalDatabaseState;
   if (database) return database;
   const environment=databaseEnvironment(),filePath=getDatabasePath(),networkPath=/^(\\\\|\/\/)/.test(filePath);
   const initializeProduction=process.env.ONMAEUM_INITIALIZE_PRODUCTION_DB==='1';

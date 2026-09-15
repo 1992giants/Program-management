@@ -76,6 +76,21 @@ npm run db:check-backup -- production-backup-manual-<timestamp>-<random>.sqlite
 
 점검은 SHA-256, SQLite integrity, foreign key, 목적별 schema 및 manifest 일치를 확인합니다. 목적별로 최신 20개는 보존하고, 90일을 넘긴 검증된 백업만 정리합니다. 정리 실패는 백업 생성 결과의 경고로 표시되며 임의 파일은 삭제하지 않습니다.
 
+### 복원 전 점검과 월간 복원 훈련
+
+`db:check-backup`은 백업 artifact 자체의 manifest·SHA-256·SQLite·FK·현재 schema 적합성을 읽기 전용으로 확인합니다. `db:restore-drill`은 운영 DB를 변경하지 않고 임시 최신 schema DB에 실제 복원 엔진으로 업무 데이터를 복사한 뒤 marker, baseline, FK와 프로그램·차수·출석 관계를 다시 검증합니다.
+
+실제 복원 전에는 같은 basename으로 다음 순서를 따르세요.
+
+```powershell
+npm run db:check-backup -- production-backup-manual-<timestamp>-<random>.sqlite
+npm run db:restore-drill -- production-backup-manual-<timestamp>-<random>.sqlite
+```
+
+두 명령이 모두 성공한 뒤 관리자 설정 화면에서 해당 백업을 복원합니다. 복원 직전 현재 DB의 검증된 `restore_safety` 백업이 생성되며, 업무 데이터 복원·일관성 검증·감사 기록·모든 로그인 세션 삭제가 하나의 DB transaction으로 처리됩니다. 성공 응답은 브라우저 쿠키를 만료하므로 관리자도 다시 로그인해야 합니다. 재로그인 후 참가자·프로그램·출석·성과 화면의 핵심 건수를 확인하세요.
+
+매월 1회 최신 `manual` 또는 `restore_safety` 백업에 대해 위 두 명령을 실행하고 결과를 운영 점검 기록에 남기세요. `migration_safety`, manifest 없는 legacy 파일, 외부 경로는 일반 복원과 복원 훈련 대상이 아닙니다. SHA-256 manifest는 우발적 변경 탐지 수단이며 서명이나 공격자 인증 수단은 아닙니다.
+
 marker 없는 기존 DB에 `USR-ADMIN`도 함께 남아 있고 schema가 이미 current version이라면 두 절차를 동시에 명시할 수 있습니다. v0 DB라면 adoption → schema migration → USR-ADMIN migration을 각각 실행합니다.
 
 ```powershell

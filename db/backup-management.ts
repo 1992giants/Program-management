@@ -7,6 +7,8 @@ import { CURRENT_SCHEMA_VERSION, classifyKnownV0Schema, schemaFingerprint, valid
 export type BackupPurpose='manual'|'migration_safety'|'restore_safety';
 export type BackupArtifact={basename:string;purpose:BackupPurpose;created_at:string;size:number;schema_version:number;verified:true};
 export type BackupRetentionWarning={code:'retention_cleanup_failed';basename?:string};
+export type VerifiedBackupArtifactIdentity={basename:string;canonicalBackupPath:string;canonicalManifestPath:string;sha256:string;manifestSha256:string;byteSize:number;purpose:BackupPurpose;schemaVersion:number;schemaFingerprint:string;manifestVersion:1};
+export type VerifiedBackupArtifact={artifact:BackupArtifact;identity:VerifiedBackupArtifactIdentity};
 type BackupManifest={manifest_version:1;backup_basename:string;purpose:BackupPurpose;created_at:string;byte_size:number;sha256:string;schema_version:number;schema_fingerprint:string};
 type ArtifactIdentity={timestamp:number;nonce:string};
 
@@ -58,7 +60,7 @@ function integrityCheck(db:DatabaseSync){
   if(rows.length!==1||rows[0].integrity_check!=='ok')fail('SQLite integrity_check failed.');
 }
 function setting(db:DatabaseSync,key:string){return (db.prepare('SELECT value FROM settings WHERE key=?').get(key) as {value:string}|undefined)?.value;}
-function validateProductionMetadata(db:DatabaseSync){
+export function validateProductionMetadata(db:DatabaseSync){
   const expectedEnvironment=process.env.NODE_ENV==='production'?'production':process.env.NODE_ENV==='test'?'test':'development';
   if(setting(db,'application_id')!==APPLICATION_ID||setting(db,'database_environment')!==expectedEnvironment)fail('백업이 현재 환경의 Onmaeum DB marker와 일치하지 않습니다.');
   if(!setting(db,'center_name')?.trim()||!setting(db,'manager_name')?.trim())fail('백업에 필요한 production baseline 설정이 없습니다.');
@@ -89,18 +91,20 @@ function readManifest(root:string,sourceDatabasePath:string,basename:string){
   const parsed=parseBasename(sourceDatabasePath,basename);
   if(!parsed)fail('허용되지 않은 백업 파일명입니다.');
   const databasePath=regularFileInside(root,basename),sidecar=regularFileInside(root,manifestPath(basename));
-  let manifest:BackupManifest;
-  try { manifest=JSON.parse(readFileSync(sidecar,'utf8')) as BackupManifest; } catch { fail('백업 manifest를 읽을 수 없습니다.'); }
+  const manifestBytes=readFileSync(sidecar);let manifest:BackupManifest;
+  try { manifest=JSON.parse(manifestBytes.toString('utf8')) as BackupManifest; } catch { fail('백업 manifest를 읽을 수 없습니다.'); }
   const expectedVersion=parsed.purpose==='migration_safety'?0:CURRENT_SCHEMA_VERSION;
   if(!manifest||manifest.manifest_version!==1||manifest.backup_basename!==basename||manifest.purpose!==parsed.purpose||!PURPOSES.has(manifest.purpose)||typeof manifest.created_at!=='string'||!validIsoTimestamp(manifest.created_at)||!Number.isSafeInteger(manifest.byte_size)||manifest.byte_size<=0||typeof manifest.sha256!=='string'||!/^[0-9a-f]{64}$/.test(manifest.sha256)||manifest.schema_version!==expectedVersion||typeof manifest.schema_fingerprint!=='string'||!/^[0-9a-f]{64}$/.test(manifest.schema_fingerprint))fail('백업 manifest 형식이 올바르지 않습니다.');
   if(statSync(databasePath).size!==manifest.byte_size)fail('백업 파일 크기가 manifest와 일치하지 않습니다.');
-  return {databasePath,manifest};
+  return {databasePath,manifestPath:sidecar,manifest,manifestSha256:createHash('sha256').update(manifestBytes).digest('hex')};
 }
 
 export function resolveBackupBasename(sourceDatabasePath:string,backupDirectory:string,basename:string){
   const root=canonicalRoot(backupDirectory);
   return readManifest(root,sourceDatabasePath,basename).databasePath;
 }
+
+export function copyFileExclusive(source:string,destination:string){publishExclusive(source,destination);}
 
 export async function createVerifiedBackup(source:DatabaseSync,{sourceDatabasePath,backupDirectory,purpose,expectedSource,artifactIdentity}:{sourceDatabasePath:string;backupDirectory:string;purpose:BackupPurpose;expectedSource?:{version:number;fingerprint:string};artifactIdentity?:ArtifactIdentity}):Promise<{artifact:BackupArtifact;retentionWarnings:BackupRetentionWarning[]}> {
   const root=canonicalRoot(backupDirectory,{create:true});
@@ -131,15 +135,20 @@ export async function createVerifiedBackup(source:DatabaseSync,{sourceDatabasePa
   }
 }
 
-export function verifyBackupArtifact(sourceDatabasePath:string,backupDirectory:string,basename:string):BackupArtifact {
-  const root=canonicalRoot(backupDirectory),{databasePath,manifest}=readManifest(root,sourceDatabasePath,basename);
-  if(sha256(databasePath)!==manifest.sha256)fail('백업 SHA-256이 manifest와 일치하지 않습니다.');
+export function verifyBackupArtifactDetailed(sourceDatabasePath:string,backupDirectory:string,basename:string):VerifiedBackupArtifact {
+  const root=canonicalRoot(backupDirectory),{databasePath,manifestPath:canonicalManifestPath,manifest,manifestSha256}=readManifest(root,sourceDatabasePath,basename),actualSha256=sha256(databasePath);
+  if(actualSha256!==manifest.sha256)fail('백업 SHA-256이 manifest와 일치하지 않습니다.');
   const candidate=new DatabaseSync(databasePath,{readOnly:true});
   try {
     const actual=validateCandidate(candidate,manifest.purpose,manifest.purpose==='migration_safety'?{version:manifest.schema_version,fingerprint:manifest.schema_fingerprint}:undefined);
     if(actual.schemaVersion!==manifest.schema_version||actual.fingerprint!==manifest.schema_fingerprint)fail('백업 schema fingerprint가 manifest와 일치하지 않습니다.');
   } finally { candidate.close(); }
-  return {basename,purpose:manifest.purpose,created_at:manifest.created_at,size:manifest.byte_size,schema_version:manifest.schema_version,verified:true};
+  const artifact={basename,purpose:manifest.purpose,created_at:manifest.created_at,size:manifest.byte_size,schema_version:manifest.schema_version,verified:true} as BackupArtifact;
+  return {artifact,identity:{basename,canonicalBackupPath:databasePath,canonicalManifestPath,sha256:actualSha256,manifestSha256,byteSize:manifest.byte_size,purpose:manifest.purpose,schemaVersion:manifest.schema_version,schemaFingerprint:manifest.schema_fingerprint,manifestVersion:manifest.manifest_version}};
+}
+
+export function verifyBackupArtifact(sourceDatabasePath:string,backupDirectory:string,basename:string):BackupArtifact {
+  return verifyBackupArtifactDetailed(sourceDatabasePath,backupDirectory,basename).artifact;
 }
 
 function scanBackupArtifacts(sourceDatabasePath:string,backupDirectory:string):BackupArtifact[] {
