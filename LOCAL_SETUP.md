@@ -64,6 +64,18 @@ Sprint 1A 이전에 만들어진 marker 없는 기존 DB는 먼저 백업과 경
 
 이 명령은 migration 전 안전 백업을 만들고, 알려진 v0 구조만 transaction 안에서 최신 schema로 올립니다. 성공 후에만 `PRAGMA user_version`이 갱신됩니다. 알 수 없는 구조, 보강 회기 orphan 참조, 더 높은 version은 자동 수정하지 않고 중단합니다. 동일 작업은 환경변수를 설정한 터미널에서 `npm run db:migrate-schema`로도 실행할 수 있습니다. 배포 시에는 `adopt`(필요한 경우) → `migrate-schema` → `validate` → 정상 시작 순서를 사용하세요.
 
+### 백업 검증과 보존
+
+설정 화면에서 생성하는 수동 백업과 schema migration/복원 전 안전 백업은 이름·목적·생성 시각·크기·SHA-256·schema fingerprint를 담은 manifest 쌍으로만 게시됩니다. 생성 직후 읽기 전용 연결에서 SQLite integrity, foreign key, schema, production marker, 활성 관리자와 baseline catalog를 다시 확인합니다. 임시 파일·manifest 없는 파일·기존 legacy 파일은 자동 목록과 복원 선택에 나타나지 않습니다.
+
+백업 목록과 API는 서버의 절대 경로를 반환하지 않고 basename만 사용합니다. 관리자가 터미널에서 점검할 때는 다음처럼 basename을 전달합니다.
+
+```powershell
+npm run db:check-backup -- production-backup-manual-<timestamp>-<random>.sqlite
+```
+
+점검은 SHA-256, SQLite integrity, foreign key, 목적별 schema 및 manifest 일치를 확인합니다. 목적별로 최신 20개는 보존하고, 90일을 넘긴 검증된 백업만 정리합니다. 정리 실패는 백업 생성 결과의 경고로 표시되며 임의 파일은 삭제하지 않습니다.
+
 marker 없는 기존 DB에 `USR-ADMIN`도 함께 남아 있고 schema가 이미 current version이라면 두 절차를 동시에 명시할 수 있습니다. v0 DB라면 adoption → schema migration → USR-ADMIN migration을 각각 실행합니다.
 
 ```powershell
@@ -110,8 +122,8 @@ npm run audit:scan -- --database "C:\OnmaeumProgramCare\data\onmaeum.sqlite"
 - 개발용 더미 데이터는 development에서 `ONMAEUM_ENABLE_DEMO_SEED=1`을 명시한 경우에만 생성되며 production에서는 항상 차단됩니다.
 - 직원 계정은 공유하지 말고 관리자·일반 담당자·출석 입력 전용 권한을 업무에 맞게 부여하세요.
 - 동시에 여러 프로그램이 SQLite 파일을 직접 열면 손상 위험이 있으므로 직원 PC는 반드시 브라우저로만 접속합니다.
-- 업무 종료 전 설정 화면의 ‘백업 파일 만들기’를 사용한 뒤 서버를 종료하세요.
-- 복원 전에는 반드시 ‘무결성 점검’을 실행하세요. 복원을 시작하면 현재 데이터는 자동으로 별도 안전 백업됩니다.
+- 업무 종료 전 설정 화면의 ‘검증된 백업 만들기’를 사용한 뒤 서버를 종료하세요.
+- 복원 전에는 반드시 ‘무결성 점검’을 실행하세요. 복원을 시작하면 현재 데이터는 검증된 별도 안전 백업으로 먼저 저장됩니다.
 - 백업 복원 중에는 다른 직원이 참가자·출석 정보를 입력하지 않도록 안내하세요.
 - 서버 종료 후 외장하드를 안전하게 분리하세요.
 - Windows 방화벽에서 3000번 포트는 센터 내부 네트워크에만 허용하세요.

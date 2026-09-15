@@ -1,8 +1,7 @@
-import { backup, DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import path from 'node:path';
-import { createRun, getBackupDirectory, getDatabase, getDatabasePath, getStorageInfo, hashPin, verifyPin, withImmediateTransaction } from '../../../db/index.ts';
+import { createRun, getBackupDirectory, getDatabase, getDatabasePath, hashPin, verifyPin, withImmediateTransaction } from '../../../db/index.ts';
+import { createVerifiedBackup, listBackupArtifacts, resolveBackupBasename, verifyBackupArtifact } from '../../../db/backup-management.ts';
 import { attendanceOnlySnapshot, canPerformAction, createAuthSession, expiredSessionCookie, getAuthenticatedUser, invalidateAuthSession, sessionCookie, validateMutationRequest, type SafeUser } from '../../../lib/security.ts';
 import { inclusiveCalendarDays, isCanonicalCalendarDate } from '../../../lib/schedule-state.ts';
 
@@ -69,17 +68,8 @@ function logChange(db:DatabaseSync, action:string, entityType:string, entityId:s
   const safeBefore=sanitizeAuditPayload(before),safeAfter=sanitizeAuditPayload(after);
   db.prepare('INSERT INTO audit_logs (created_at,actor,action,entity_type,entity_id,before_json,after_json,summary,reason,ip_address) VALUES (?,?,?,?,?,?,?,?,?,?)').run(createdAt,requestedActor?.trim()||'SYSTEM',action,entityType,String(entityId),safeBefore?JSON.stringify(safeBefore):'',safeAfter?JSON.stringify(safeAfter):'',summary.slice(0,200),reason.slice(0,200),ipAddress);
 }
-function backupFiles() {
-  const source=getDatabasePath(), directory=getBackupDirectory(), extension=path.extname(source)||'.sqlite', base=path.basename(source,extension);
-  if(!existsSync(directory)) return [];
-  return readdirSync(directory).filter(name=>name.startsWith(`${base}-backup-`)&&name.endsWith(extension)).map(name=>{const fullPath=path.join(directory,name),stat=statSync(fullPath);return {name,path:fullPath,size:stat.size,modified_at:stat.mtime.toISOString()}}).sort((a,b)=>b.modified_at.localeCompare(a.modified_at));
-}
-function validateBackup(filePath:string) {
-  const source=getDatabasePath(), resolved=path.resolve(filePath),backupDirectory=path.resolve(getBackupDirectory());
-  if(path.dirname(resolved)!==backupDirectory||!path.basename(resolved).startsWith(`${path.basename(source,path.extname(source))}-backup-`)||!existsSync(resolved)) throw new ActionError('설정된 백업 폴더의 백업 파일만 선택할 수 있습니다.');
-  const candidate=new DatabaseSync(resolved,{readOnly:true});
-  try { const integrity=candidate.prepare('PRAGMA integrity_check').get() as {integrity_check:string}; const tables=(candidate.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as {name:string}[]).map(row=>row.name); const required=['participants','programs','program_runs','sessions','applications','attendance','settings']; const missing=required.filter(name=>!tables.includes(name)); if(integrity.integrity_check!=='ok'||missing.length) throw new ActionError(`백업 점검 실패${missing.length?`: 누락 테이블 ${missing.join(', ')}`:''}`); return {ok:true,message:'무결성 점검 정상',tables:tables.length}; } finally { candidate.close(); }
-}
+function backupFiles() { return listBackupArtifacts(getDatabasePath(),getBackupDirectory()); }
+function backupFailure(code:'backup_creation_failed'|'backup_verification_failed'|'backup_restore_preflight_failed',error:unknown):never { console.error(`[api/data] ${code}`,error);throw new ActionError(code); }
 
 function staffSnapshot(currentUser:SafeUser) {
   const settings=Object.fromEntries((rows(`SELECT key,value FROM settings WHERE key='center_name'`) as {key:string;value:string}[]).map(item=>[item.key,item.value]));
@@ -117,8 +107,8 @@ function adminSnapshot(currentUser:SafeUser) {
   for(const participant of participants){const key=`${String(participant.name).trim()}|${String(participant.phone).replace(/\D/g,'')}`;if(!String(participant.phone).replace(/\D/g,''))continue;duplicateMap.set(key,[...(duplicateMap.get(key)||[]),participant]);}
   return {
     settings,
-    databasePath:getDatabasePath(),
-    storageInfo:getStorageInfo(),
+    databasePath:'로컬 데이터베이스',
+    storageInfo:{architecture:'단일 서버 프로세스',journalMode:'DELETE'},
     participants,
     duplicateGroups:[...duplicateMap.values()].filter(group=>group.length>1),
     programs: rows(`SELECT p.*, COUNT(DISTINCT r.id) AS run_count, COUNT(DISTINCT a.id) AS applicant_count FROM programs p LEFT JOIN program_runs r ON r.program_id=p.id LEFT JOIN applications a ON a.program_id=p.id GROUP BY p.id ORDER BY p.created_at DESC`),
@@ -443,20 +433,17 @@ async function handlePOST(request:Request) {
       const changedSettingFields=['center_name','manager_name'].filter(key=>current[key]!==({center_name:centerName,manager_name:managerName})[key]);
       withImmediateTransaction(db,()=>{db.prepare(`INSERT INTO settings (key,value) VALUES ('center_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(centerName);db.prepare(`INSERT INTO settings (key,value) VALUES ('manager_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(managerName);if(changedSettingFields.length)logChange(db,'settings_update','설정','system',null,{changed_fields:changedSettingFields,center_name_changed:changedSettingFields.includes('center_name'),manager_name_changed:changedSettingFields.includes('manager_name')},'운영 설정 수정',user.id,'',requestIp(request))});
     } else if (body.action === 'backup') {
-      const source = getDatabasePath();
-      const ext = path.extname(source)||'.sqlite';
-      const destination = path.join(getBackupDirectory(),`${path.basename(source,ext)}-backup-${today}-${Date.now()}${ext}`);
-      await backup(db,destination);
-      logChange(db,'백업','데이터베이스',path.basename(destination),null,{backup_file:path.basename(destination)},'로컬 데이터 백업 생성',user.id,'',requestIp(request));
-      return Response.json({ ...snapshot(user), backupPath:destination });
+      let result;try {result=await createVerifiedBackup(db,{sourceDatabasePath:getDatabasePath(),backupDirectory:getBackupDirectory(),purpose:'manual'});}catch(error){backupFailure('backup_creation_failed',error)}
+      logChange(db,'백업','데이터베이스',result.artifact.basename,null,{backup_file:result.artifact.basename,purpose:result.artifact.purpose,verified:true},'로컬 데이터 백업 생성',user.id,'',requestIp(request));
+      return Response.json({ ...snapshot(user), backup:result.artifact,warning:result.retentionWarnings.length?'retention_cleanup_failed':undefined });
     } else if (body.action === 'checkBackup') {
-      const result=validateBackup(text(body.path));
-      logChange(db,'백업 점검','데이터베이스',path.basename(text(body.path)),null,result,`백업 파일 무결성 점검: ${result.message}`,user.id,'',requestIp(request));
+      const basename=text(body.basename);let artifact;try {artifact=verifyBackupArtifact(getDatabasePath(),getBackupDirectory(),basename);}catch(error){backupFailure('backup_verification_failed',error)}
+      const result={ok:true,message:'SHA-256·SQLite·FK·스키마 점검 정상',artifact};
+      logChange(db,'백업 점검','데이터베이스',basename,null,{backup_file:basename,purpose:artifact.purpose,verified:true},'백업 파일 무결성 점검',user.id,'',requestIp(request));
       return Response.json({...snapshot(user),backupCheck:result});
     } else if (body.action === 'restoreBackup') {
-      const restorePath=text(body.path);validateBackup(restorePath);
-      const source=getDatabasePath(),extension=path.extname(source)||'.sqlite',safetyPath=path.join(getBackupDirectory(),`${path.basename(source,extension)}-backup-before-restore-${today}-${Date.now()}${extension}`);
-      await backup(db,safetyPath);
+      const restoreBasename=text(body.basename);let restorePath;try {const artifact=verifyBackupArtifact(getDatabasePath(),getBackupDirectory(),restoreBasename);if(!['manual','restore_safety'].includes(artifact.purpose))throw new Error('Backup purpose is not restore-compatible.');restorePath=resolveBackupBasename(getDatabasePath(),getBackupDirectory(),restoreBasename);}catch(error){backupFailure('backup_restore_preflight_failed',error)}
+      let safety;try {safety=await createVerifiedBackup(db,{sourceDatabasePath:getDatabasePath(),backupDirectory:getBackupDirectory(),purpose:'restore_safety'});}catch(error){backupFailure('backup_creation_failed',error)}
       const candidate=new DatabaseSync(restorePath,{readOnly:true});
       const tables=['settings','participants','programs','program_runs','sessions','applications','attendance','certificates'];
       const candidateTables=new Set((candidate.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as {name:string}[]).map(row=>row.name));
@@ -471,10 +458,10 @@ async function handlePOST(request:Request) {
         for(const table of tables){const sourceRows=candidate.prepare(`SELECT * FROM ${table}`).all() as Record<string,SQLInputValue>[];if(!sourceRows.length)continue;const columns=Object.keys(sourceRows[0]);const insert=db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`);for(const row of sourceRows)insert.run(...columns.map(column=>row[column]));}
         for(const table of outcomeTables){const sourceRows=candidate.prepare(`SELECT * FROM ${table}`).all() as Record<string,SQLInputValue>[];if(!sourceRows.length)continue;const columns=Object.keys(sourceRows[0]);const insert=db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`);for(const row of sourceRows)insert.run(...columns.map(column=>row[column]));}
         for(const table of optionalTables){const sourceRows=candidate.prepare(`SELECT * FROM ${table}`).all() as Record<string,SQLInputValue>[];if(!sourceRows.length)continue;const columns=Object.keys(sourceRows[0]);const insert=db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(()=>'?').join(',')})`);for(const row of sourceRows)insert.run(...columns.map(column=>row[column]));}
-        logChange(db,'복원','데이터베이스',path.basename(restorePath),{safety_backup:path.basename(safetyPath)},{restored_from:path.basename(restorePath)},`백업 복원 완료 · 복원 전 안전 백업 생성`,user.id,'',requestIp(request));
+        logChange(db,'복원','데이터베이스',restoreBasename,{safety_backup:safety.artifact.basename},{restored_from:restoreBasename},`백업 복원 완료 · 복원 전 안전 백업 생성`,user.id,'',requestIp(request));
         db.exec('COMMIT');
       } catch(error){db.exec('ROLLBACK');throw error;} finally {candidate.close();}
-      return Response.json({...snapshot(user),restoreMessage:`복원 완료 · 안전 백업: ${safetyPath}`});
+      return Response.json({...snapshot(user),restoreMessage:'복원 완료 · 복원 전 안전 백업을 생성했습니다.',warning:safety.retentionWarnings.length?'retention_cleanup_failed':undefined});
     } else if (body.action === 'certificate') {
       const participant=db.prepare('SELECT id FROM participants WHERE id=?').get(text(body.participantId)) as {id:string}|undefined,sessionCount=Number(body.sessionCount);
       if(!participant||!Number.isInteger(sessionCount)||sessionCount<1)throw new ActionError('참가자와 참여 회기 수를 올바르게 입력하세요.');

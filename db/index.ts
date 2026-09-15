@@ -1,8 +1,9 @@
-import { backup, DatabaseSync } from 'node:sqlite';
+import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { CURRENT_SCHEMA_VERSION, classifyKnownV0Schema, createLatestSchema, migrateKnownV0Schema, schemaFingerprint, validateLatestSchema } from './schema-management.ts';
+import { createVerifiedBackup } from './backup-management.ts';
 
 export { CURRENT_SCHEMA_VERSION } from './schema-management.ts';
 
@@ -268,9 +269,8 @@ export function migrateLegacyAdministratorExplicitly(){
 export async function migrateProductionSchemaExplicitly(){
   const filePath=assertProductionDatabasePath();
   if(!existsSync(filePath))throw new Error('migrate-schema 대상 운영 DB 파일이 존재하지 않습니다.');
-  mkdirSync(getBackupDirectory(),{recursive:true});
   const db=new DatabaseSync(filePath);
-  let safetyPath='';
+  let safetyBackup:string|null=null;
   try {
     configureConnection(db);
     integrityCheck(db);
@@ -285,18 +285,12 @@ export async function migrateProductionSchemaExplicitly(){
     }
     if(version>CURRENT_SCHEMA_VERSION)throw new Error(`Database schema version ${version} is newer than application version ${CURRENT_SCHEMA_VERSION}; downgrade is refused.`);
     const profile=classifyKnownV0Schema(db),beforeFingerprint=schemaFingerprint(db);
-    const extension=path.extname(filePath)||'.sqlite';
-    safetyPath=path.join(getBackupDirectory(),`${path.basename(filePath,extension)}-backup-before-schema-v${CURRENT_SCHEMA_VERSION}-${Date.now()}${extension}`);
-    await backup(db,safetyPath);
-    const safety=new DatabaseSync(safetyPath,{readOnly:true});
-    try {
-      integrityCheck(safety);
-      const safetyVersion=Number((safety.prepare('PRAGMA user_version').get() as {user_version:number}).user_version);
-      if(safetyVersion!==0||schemaFingerprint(safety)!==beforeFingerprint)throw new Error('Schema migration safety backup verification failed.');
-    } finally {safety.close()}
+    const safety=await createVerifiedBackup(db,{sourceDatabasePath:filePath,backupDirectory:getBackupDirectory(),purpose:'migration_safety',expectedSource:{version:0,fingerprint:beforeFingerprint}});
+    safetyBackup=safety.artifact.basename;
+    for(const warning of safety.retentionWarnings)console.warn(warning);
     const migrated=migrateKnownV0Schema(db);
     validateProductionState(db,{allowLegacyAdministrator:true});
-    return {...migrated,profile,safetyBackup:path.basename(safetyPath),alreadyCurrent:false as const};
+    return {...migrated,profile,safetyBackup,alreadyCurrent:false as const};
   } finally {db.close()}
 }
 

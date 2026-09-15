@@ -1,8 +1,9 @@
-const requestedModes=new Set(process.argv.slice(2));
-const supportedModes=new Set(['initialize','adopt','migrate','migrate-schema','validate']);
+const arguments_=process.argv.slice(2),requestedModes=new Set(arguments_);
+const supportedModes=new Set(['initialize','adopt','migrate','migrate-schema','validate','check-backup']);
 const {existsSync,rmSync}=await import('node:fs');
 
-if(!requestedModes.size||[...requestedModes].some(mode=>!supportedModes.has(mode))||requestedModes.has('validate')&&requestedModes.size!==1||requestedModes.has('initialize')&&requestedModes.size!==1||requestedModes.has('migrate-schema')&&requestedModes.size!==1){
+const checkBackup=arguments_[0]==='check-backup';
+if(!requestedModes.size||checkBackup&&arguments_.length!==2||!checkBackup&&[...requestedModes].some(mode=>!supportedModes.has(mode))||requestedModes.has('validate')&&requestedModes.size!==1||requestedModes.has('initialize')&&requestedModes.size!==1||requestedModes.has('migrate-schema')&&requestedModes.size!==1){
   console.error('Production database command is invalid.');
   process.exit(2);
 }
@@ -25,11 +26,14 @@ let databasePath='';
 let databaseExisted=false;
 let db;
 try {
-  const {adoptProductionDatabaseExplicitly,getDatabase,getDatabasePath,migrateLegacyAdministratorExplicitly,migrateProductionSchemaExplicitly,validateProductionDatabaseReadOnly}=await import('../db/index.ts');
+  const {adoptProductionDatabaseExplicitly,getBackupDirectory,getDatabase,getDatabasePath,migrateLegacyAdministratorExplicitly,migrateProductionSchemaExplicitly,validateProductionDatabaseReadOnly}=await import('../db/index.ts');
   databasePath=getDatabasePath();
   databaseExisted=existsSync(databasePath);
   let result;
-  if(requestedModes.has('validate'))result=validateProductionDatabaseReadOnly();
+  if(checkBackup){
+    const {verifyBackupArtifact}=await import('../db/backup-management.ts');
+    result=verifyBackupArtifact(databasePath,getBackupDirectory(),arguments_[1]);
+  } else if(requestedModes.has('validate'))result=validateProductionDatabaseReadOnly();
   else if(requestedModes.has('migrate-schema'))result=await migrateProductionSchemaExplicitly();
   else if(requestedModes.has('initialize')){
     process.env.ONMAEUM_INITIALIZE_PRODUCTION_DB='1';

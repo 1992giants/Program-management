@@ -13,6 +13,7 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "db:migrate-schema": "node --experimental-strip-types scripts/production-database.mjs migrate-schema",
+    "db:check-backup": "node --experimental-strip-types scripts/production-database.mjs check-backup",
     "verify-db": "node scripts/verify-db.mjs",
     "audit:scan": "node scripts/audit-sensitive-scan.mjs"
   },

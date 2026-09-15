@@ -117,13 +117,12 @@ test('감사로그는 관리자 전용이며 민감 원문과 credential을 복�
     const backupResponse=await post({action:'backup'},admin.cookie);
     assert.equal(backupResponse.status,200);
     const backupBody=await backupResponse.json(),backupLog=auditRow('백업','데이터베이스');
-    assert.equal(auditText(backupLog).includes(path.dirname(backupBody.backupPath)),false);
-    assert.equal(JSON.parse(backupLog.after_json).backup_file,path.basename(backupBody.backupPath));
-    const restoreResponse=await post({action:'restoreBackup',path:backupBody.backupPath},admin.cookie);
+    assert.equal(Object.hasOwn(backupBody,'backupPath'),false);
+    assert.equal(JSON.parse(backupLog.after_json).backup_file,backupBody.backup.basename);
+    const restoreResponse=await post({action:'restoreBackup',basename:backupBody.backup.basename},admin.cookie);
     assert.equal(restoreResponse.status,200);
     const restoreLog=auditRow('복원','데이터베이스'),restoreText=auditText(restoreLog);
-    assert.equal(restoreText.includes(path.dirname(backupBody.backupPath)),false);
-    assert.equal(JSON.parse(restoreLog.after_json).restored_from,path.basename(backupBody.backupPath));
+    assert.equal(JSON.parse(restoreLog.after_json).restored_from,backupBody.backup.basename);
 
     const allAudit=JSON.stringify(db.prepare('SELECT actor,before_json,after_json,summary,reason FROM audit_logs').all());
     for(const secret of ['86420975','75310864','24681357',admin.cookie.slice(SESSION_COOKIE_NAME.length+1),staff.cookie.slice(SESSION_COOKIE_NAME.length+1),attendance.cookie.slice(SESSION_COOKIE_NAME.length+1)])assert.equal(allAudit.includes(secret),false);
