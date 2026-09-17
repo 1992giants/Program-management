@@ -248,6 +248,7 @@ async function handlePOST(request:Request) {
     if(user.must_change_pin&&!['changeMyPin','logout'].includes(action))return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!canPerformAction(user,action))return Response.json({error:`${user.role} 권한으로는 이 작업을 수행할 수 없습니다.`},{status:403});
     let responseWarning='';
     let updatedApplicationReason:{applicationId:number;reasonPresent:boolean;statusReason:string}|undefined;
+    let importResult:{processedCount:number;acceptedCount:number;participantCreatedCount:number;applicationCreatedCount:number;applicationUpdatedCount:number;rejectedCount:number;rejectedRows:{rowNumber:number;reason:string}[]}|undefined;
     let invalidateCurrentSession=false;
     if(body.action==='logout'){
       withImmediateTransaction(db,()=>{invalidateAuthSession(request,db);logChange(db,'로그아웃','사용자',user.id,null,null,'로그아웃',user.id,'',requestIp(request))});
@@ -314,11 +315,43 @@ async function handlePOST(request:Request) {
       const fields=changedFields(before,after,['name','category','delivery_type','location','manager','capacity','status']);
       const affectedSessionCount=(db.prepare(`SELECT COUNT(*) AS count FROM sessions WHERE run_id IN (SELECT id FROM program_runs WHERE program_id=?) AND COALESCE(location,'')<>?`).get(programId,after.location) as {count:number}).count;
       withImmediateTransaction(db,()=>{db.prepare('UPDATE programs SET name=?,category=?,delivery_type=?,location=?,manager=?,capacity=?,status=? WHERE id=?').run(after.name,after.category,after.delivery_type,after.location,after.manager,after.capacity,after.status,programId);db.prepare('UPDATE sessions SET location=? WHERE run_id IN (SELECT id FROM program_runs WHERE program_id=?)').run(after.location,programId);const canonical=db.prepare('SELECT id,location FROM programs WHERE id=?').get(programId) as {id:string;location:string}|undefined;if(!canonical||canonical.location!==after.location)throw new Error('Program update did not produce a canonical result.');logChange(db,'program_update','프로그램',canonical.id,null,{changed_fields:fields,...(fields.includes('status')?{status_before:String(before.status),status_after:after.status}:{}),name_changed:fields.includes('name'),manager_changed:fields.includes('manager'),location_changed:fields.includes('location'),session_location_updated:affectedSessionCount>0,affected_session_count:affectedSessionCount},'프로그램 정보 수정',user.id,'',requestIp(request))});
-    } else if (body.action === 'updateRunStatus') {
+    } else if (body.action === 'updateRun') {
+      const runId=text(body.id).trim(),label=text(body.label).trim(),run=db.prepare('SELECT id,program_id,label FROM program_runs WHERE id=?').get(runId) as {id:string;program_id:string;label:string}|undefined;
+      if(!run)throw new ActionError('차수를 찾을 수 없습니다.');if(!label||label.length>100)throw new ActionError('차수 이름을 1~100자로 입력하세요.');
+      if(run.label!==label)withImmediateTransaction(db,()=>{db.prepare('UPDATE program_runs SET label=? WHERE id=?').run(label,run.id);logChange(db,'run_update','차수',run.id,null,{program_id:run.program_id,changed_fields:['label']},'프로그램 차수 이름 수정',user.id,'',requestIp(request))});
+    } else if (body.action === 'removeFromRun') {
+      const applicationId=Number(body.applicationId),runId=text(body.runId).trim(),application=db.prepare('SELECT id,program_id,run_id FROM applications WHERE id=?').get(applicationId) as {id:number;program_id:string;run_id:string|null}|undefined;
+      if(!application||!Number.isInteger(applicationId)||application.run_id!==runId)throw new ActionError('해당 차수에 배정된 신청자를 찾을 수 없습니다.');
+      const run=db.prepare('SELECT id,program_id FROM program_runs WHERE id=?').get(runId) as {id:string;program_id:string}|undefined;if(!run||run.program_id!==application.program_id)throw new ActionError('신청자와 차수 범위를 확인하세요.');
+      withImmediateTransaction(db,()=>{db.prepare('UPDATE applications SET run_id=NULL,assigned_at=NULL WHERE id=? AND run_id=?').run(application.id,run.id);logChange(db,'run_unassign','신청',application.id,null,{program_id:application.program_id,run_id:run.id},'차수 배정 해제',user.id,'',requestIp(request))});
+    } else if (body.action === 'deleteRun') {
+      const runId=text(body.id).trim(),run=db.prepare('SELECT id,program_id,label FROM program_runs WHERE id=?').get(runId) as {id:string;program_id:string;label:string}|undefined;if(!run)throw new ActionError('삭제할 차수를 찾을 수 없습니다.');
+      const assigned=(db.prepare('SELECT COUNT(*) AS count FROM applications WHERE run_id=?').get(run.id) as {count:number}).count,sessionCount=(db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE run_id=?').get(run.id) as {count:number}).count;
+      withImmediateTransaction(db,()=>{db.prepare('DELETE FROM program_runs WHERE id=?').run(run.id);logChange(db,'run_delete','차수',run.id,null,{program_id:run.program_id,unassigned_application_count:assigned,deleted_session_count:sessionCount},'프로그램 차수 삭제',user.id,'',requestIp(request))});    } else if (body.action === 'updateRunStatus') {
       const statuses=['모집 예정','모집 중','모집 마감','참가자 확정','진행 중','종료','취소'],status=text(body.status),id=text(body.id),before=db.prepare('SELECT * FROM program_runs WHERE id=?').get(id);
       if(!before||!statuses.includes(status))throw new ActionError('올바른 차수 운영 상태를 선택하세요.');
       const reason=text(body.reason).trim(),runId=String((before as Record<string,unknown>).id);if(status==='취소'&&!reason)throw new ActionError('차수 취소 사유를 입력하세요.');const now=new Date().toISOString(),closed=['종료','취소'].includes(status);db.exec('BEGIN IMMEDIATE');try{db.prepare('UPDATE program_runs SET status=?,closed_at=?,closed_by=? WHERE id=?').run(status,closed?now:null,closed?user.display_name:null,runId);if(status==='진행 중')db.prepare(`UPDATE applications SET status='참가중',status_updated_at=? WHERE run_id=? AND status IN ('신청','선정검토','참가대기')`).run(now,runId);if(status==='종료')db.prepare(`UPDATE applications SET status='참가완료',status_updated_at=? WHERE run_id=? AND status='참가중'`).run(now,runId);if(status==='취소')db.prepare(`UPDATE applications SET status='취소',status_reason=?,status_updated_at=? WHERE run_id=? AND status NOT IN ('참가완료','중도탈락','취소')`).run(reason,now,runId);logChange(db,'차수 상태','차수',runId,{status:String((before as Record<string,unknown>).status)},{status,reason_present:Boolean(reason)},`차수 상태를 ${status}(으)로 변경`,user.id,'',requestIp(request));db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
-    } else if (body.action === 'updateSession') {
+    } else if (body.action === 'updateSessionsBulk') {
+      const requestedProgramId=text(body.programId).trim(),requestedRunId=text(body.runId).trim(),items=Array.isArray(body.sessions)?body.sessions as Record<string,unknown>[]:[];
+      if(!requestedProgramId||!requestedRunId||items.length<1||items.length>100)throw new ActionError('저장할 회기 변경사항을 올바르게 선택하세요.');
+      const run=db.prepare('SELECT id,program_id FROM program_runs WHERE id=?').get(requestedRunId) as {id:string;program_id:string}|undefined;
+      if(!run||run.program_id!==requestedProgramId)throw new ActionError('선택한 프로그램과 차수 범위를 확인하세요.');
+      const ids=items.map(item=>text(item.id).trim());if(ids.some(id=>!id)||new Set(ids).size!==ids.length)throw new ActionError('회기 정보를 올바르게 선택하세요.');
+      const canonical=ids.map(id=>db.prepare('SELECT id,run_id,session_date,session_time,location FROM sessions WHERE id=?').get(id) as {id:string;run_id:string;session_date:string;session_time:string;location:string}|undefined);
+      if(canonical.some(session=>!session||session.run_id!==run.id))throw new ActionError('선택한 차수에 속한 회기만 저장할 수 있습니다.');
+      const changed=items.map((item,index)=>{const before=canonical[index]!;const after={session_date:text(item.sessionDate),session_time:text(item.sessionTime),location:text(item.location).trim()};if(!isCanonicalCalendarDate(after.session_date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(after.session_time)||!after.location)throw new ActionError(`${index+1}번째 회기의 날짜, 시간, 장소를 올바르게 입력하세요.`);return {before,after,fields:changedFields(before,after,['session_date','session_time','location'])}}).filter(item=>item.fields.length>0);
+      if(changed.length)withImmediateTransaction(db,()=>{const update=db.prepare('UPDATE sessions SET session_date=?,session_time=?,location=? WHERE id=?');for(const item of changed)update.run(item.after.session_date,item.after.session_time,item.after.location,item.before.id);const changedFieldCategories=[...new Set(changed.flatMap(item=>item.fields))];logChange(db,'sessions_bulk_update','차수',run.id,null,{program_id:run.program_id,changed_session_count:changed.length,changed_field_categories:changedFieldCategories},'프로그램 회기 일정 일괄 저장',user.id,'',requestIp(request))});
+    } else if (body.action === 'copyRun') {
+      const sourceRunId=text(body.sourceRunId).trim(),source=db.prepare('SELECT id,program_id,label,start_date FROM program_runs WHERE id=?').get(sourceRunId) as {id:string;program_id:string;label:string;start_date:string}|undefined;
+      if(!source)throw new ActionError('복사할 차수를 찾을 수 없습니다.');
+      const sourceSessions=db.prepare('SELECT session_number,session_date,session_time,location FROM sessions WHERE run_id=? ORDER BY session_number').all(source.id) as {session_number:number;session_date:string;session_time:string;location:string}[];
+      if(!sourceSessions.length)throw new ActionError('복사할 회기가 없습니다.');
+      withImmediateTransaction(db,()=>{const max=(db.prepare('SELECT COALESCE(MAX(round_number),0) AS max_round FROM program_runs WHERE program_id=?').get(source.program_id) as {max_round:number}).max_round,round=max+1,newRunId=`RUN-${source.program_id}-${round}`;db.prepare("INSERT INTO program_runs (id,program_id,round_number,label,start_date,status,closed_at,closed_by) VALUES (?,?,?,?,?,'모집 중',NULL,NULL)").run(newRunId,source.program_id,round,`${source.label} 복사본`,source.start_date);const insert=db.prepare('INSERT INTO sessions (id,run_id,session_number,session_date,session_time,location) VALUES (?,?,?,?,?,?)');for(const session of sourceSessions)insert.run(`${newRunId}-S${session.session_number}`,newRunId,session.session_number,session.session_date,session.session_time,session.location);logChange(db,'run_copy','차수',newRunId,null,{source_run_id:source.id,new_run_id:newRunId,program_id:source.program_id,copied_session_count:sourceSessions.length},'프로그램 차수 복사',user.id,'',requestIp(request))});
+    } else if (body.action === 'copyProgram') {
+      const sourceProgramId=text(body.sourceProgramId).trim(),name=text(body.name).trim(),source=db.prepare('SELECT id,category,delivery_type,session_count,recurrence,location,manager,capacity FROM programs WHERE id=?').get(sourceProgramId) as {id:string;category:string;delivery_type:string;session_count:number;recurrence:string;location:string;manager:string;capacity:number}|undefined;
+      if(!source)throw new ActionError('복사할 프로그램을 찾을 수 없습니다.');if(!name)throw new ActionError('새 프로그램명을 입력하세요.');if(db.prepare('SELECT 1 FROM programs WHERE name=?').get(name))throw new ActionError('같은 이름의 프로그램이 이미 있습니다.');
+      const assessments=db.prepare('SELECT assessment_id,sort_order FROM program_assessments WHERE program_id=? ORDER BY sort_order').all(source.id) as {assessment_id:string;sort_order:number}[],newProgramId=`PRG-${randomUUID().slice(0,8)}`;
+      withImmediateTransaction(db,()=>{db.prepare("INSERT INTO programs (id,name,category,delivery_type,session_count,recurrence,location,manager,capacity,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,'운영 중',?)").run(newProgramId,name,source.category,source.delivery_type,source.session_count,source.recurrence,source.location,source.manager,source.capacity,today);const insert=db.prepare('INSERT INTO program_assessments (program_id,assessment_id,sort_order) VALUES (?,?,?)');for(const assessment of assessments)insert.run(newProgramId,assessment.assessment_id,assessment.sort_order);logChange(db,'program_copy','프로그램',newProgramId,null,{source_program_id:source.id,new_program_id:newProgramId,copied_run_count:0,copied_session_count:0,copied_assessment_config_count:assessments.length},'프로그램 설정 복사',user.id,'',requestIp(request))});    } else if (body.action === 'updateSession') {
       const before=db.prepare('SELECT id,session_date,session_time,location FROM sessions WHERE id=?').get(text(body.id)) as {id:string;session_date:string;session_time:string;location:string}|undefined;
       if(!before)throw new ActionError('회기를 찾을 수 없습니다.');
       const after={session_date:text(body.sessionDate),session_time:text(body.sessionTime),location:text(body.location)};withImmediateTransaction(db,()=>{db.prepare('UPDATE sessions SET session_date=?,session_time=?,location=? WHERE id=?').run(after.session_date,after.session_time,after.location,before.id);logChange(db,'일정 수정','회기',before.id,{session_date:before.session_date,session_time:before.session_time,location:before.location},after,'프로그램 회기 일정 수정',user.id,'',requestIp(request))});
@@ -460,15 +493,17 @@ async function handlePOST(request:Request) {
       withImmediateTransaction(db,()=>{const result=db.prepare('INSERT INTO certificates (participant_id,issued_at,session_count) VALUES (?,?,?)').run(participant.id,today,sessionCount),certificateId=Number(result.lastInsertRowid);const certificate=db.prepare('SELECT id,participant_id,session_count FROM certificates WHERE id=?').get(certificateId) as {id:number;participant_id:string;session_count:number};logChange(db,'certificate_create','확인서',certificate.id,null,{participant_id:certificate.participant_id,session_count:certificate.session_count,issued:true},'참여확인서 발급 이력 생성',user.id,'',requestIp(request))});
     } else if (body.action === 'import') {
       if(!Array.isArray(body.rows))throw new ActionError('가져올 행 목록을 올바르게 전송하세요.');
-      const input = body.rows as Record<string,unknown>[],operationId=`IMPORT-${randomUUID()}`;
+      const input = body.rows as Record<string,unknown>[],operationId=`IMPORT-${randomUUID()}`,contextProgramId=text(body.programId).trim();
+      const contextProgram=contextProgramId?(db.prepare('SELECT id FROM programs WHERE id=?').get(contextProgramId) as {id:string}|undefined):undefined;
+      if(contextProgramId&&!contextProgram)throw new ActionError('선택한 프로그램을 찾을 수 없습니다.');
       let processedCount=0,participantCreatedCount=0,applicationCreatedCount=0,applicationUpdatedCount=0,duplicateCount=0,rejectedCount=0;
-      const participantUpdatedCount=0;
+      const participantUpdatedCount=0,rejectedRows:{rowNumber:number;reason:string}[]=[];
       withImmediateTransaction(db,()=>{
-        for (const item of input.slice(0,1000)) {
+        for (const [index,item] of input.slice(0,1000).entries()) {
           processedCount+=1;
-          const name=String(item.name||'').trim(); if(!name){rejectedCount+=1;continue;}
-          const program=db.prepare('SELECT id FROM programs WHERE name=?').get(text(item.programName)) as {id:string}|undefined;
-          if(!program){rejectedCount+=1;continue;}
+          const rowNumber=index+2,name=String(item.name||'').trim(); if(!name){rejectedCount+=1;rejectedRows.push({rowNumber,reason:'이름이 없습니다.'});continue;}
+          const program=contextProgram||db.prepare('SELECT id FROM programs WHERE name=?').get(text(item.programName)) as {id:string}|undefined;
+          if(!program){rejectedCount+=1;rejectedRows.push({rowNumber,reason:text(item.programName).trim()?'프로그램명을 찾을 수 없습니다.':'프로그램명 또는 선택한 프로그램이 필요합니다.'});continue;}
           let participant=db.prepare('SELECT id FROM participants WHERE name=? AND phone=?').get(name,text(item.phone)) as {id:string}|undefined;
           if(!participant){const id=`P-${today.slice(0,4)}-${String(Date.now()+Math.random()).replace(/\D/g,'').slice(-6)}`;db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run(id,name,text(item.gender)||'미입력',Number(item.age||0),text(item.phone),text(item.memberStatus)||'비회원','Excel 가져오기',today);participant={id};participantCreatedCount+=1;}else duplicateCount+=1;
           const existingApplication=db.prepare('SELECT id FROM applications WHERE participant_id=? AND program_id=?').get(participant.id,program.id) as {id:number}|undefined,now=new Date().toISOString();
@@ -477,9 +512,10 @@ async function handlePOST(request:Request) {
         }
         logChange(db,'import_complete','가져오기',operationId,null,{processed_count:processedCount,participant_created_count:participantCreatedCount,participant_updated_count:participantUpdatedCount,application_created_count:applicationCreatedCount,application_updated_count:applicationUpdatedCount,duplicate_count:duplicateCount,rejected_count:rejectedCount},'Excel 참가자 및 신청 가져오기 완료',user.id,'',requestIp(request));
       });
+      importResult={processedCount,acceptedCount:processedCount-rejectedCount,participantCreatedCount,applicationCreatedCount,applicationUpdatedCount,rejectedCount,rejectedRows};
     } else return Response.json({error:'지원하지 않는 작업입니다.'},{status:400});
     if(invalidateCurrentSession)return clearSessionCookie(Response.json({ok:true,loginRequired:true}));
-    return Response.json({...snapshot(user),...(responseWarning?{warning:responseWarning}:{}),...(updatedApplicationReason?{updatedApplicationReason}:{})});
+    return Response.json({...snapshot(user),...(responseWarning?{warning:responseWarning}:{}),...(updatedApplicationReason?{updatedApplicationReason}:{}),...(importResult?{importResult}:{})});
   } catch(error) { return error instanceof ActionError?Response.json({error:error.message},{status:400}):internalError(error); }
 }
 

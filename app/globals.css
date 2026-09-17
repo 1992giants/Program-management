@@ -54,3 +54,9 @@ select,input[type="checkbox"],input[type="radio"]{cursor:pointer}input[type="che
 .applicant-row>span:nth-child(3){min-width:0;color:inherit;font-size:inherit}
 .applicant-row>span:nth-child(4){color:#74817c;font-size:9px;white-space:nowrap}
 @media(max-width:720px){.applicant-row{grid-template-columns:auto 34px minmax(0,1fr);row-gap:6px}.applicant-row>span:nth-child(3){display:block;grid-column:3}.applicant-row>span:nth-child(4),.applicant-row>select{grid-column:3;width:100%}}
+
+/* Sprint 2A Fix Pack B */
+.run-actions{display:flex;align-items:center;gap:7px}.run-actions .secondary-button,.session-bulk-head button{min-height:32px;padding:7px 9px;font-size:9px}.session-bulk-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid #edf0ee}.session-bulk-head h4{margin:0!important;padding:0!important;border:0!important}.session-bulk-head button{border:1px solid #7fb3a8;border-radius:7px;background:#eaf5f2;color:#397b70;font-weight:700}.session-editor.dirty input{border-color:#8db8ae;background:#f4faf8}.session-editor b small{display:block;margin-top:2px;color:#3d7f73;font-size:7px}@media(max-width:720px){.run-actions,.session-bulk-head{align-items:stretch;flex-direction:column}.session-bulk-head button{width:100%}}
+
+/* Run deletion and rename */
+.run-label-edit{display:flex;align-items:center;gap:6px}.run-label-edit input{max-width:175px;padding:6px 8px;border:1px solid #d9e2de;border-radius:7px;font-size:12px;font-weight:700}.run-label-edit button,.danger-text{border:0;background:transparent;color:#bf6049;font-size:8px;font-weight:700}.run-actions .danger-button{min-height:32px;padding:7px 9px;font-size:9px;white-space:nowrap}.assigned-people>span .danger-text{display:block;margin-top:4px;padding:0}@media(max-width:720px){.run-label-edit{align-items:stretch;flex-direction:column}.run-label-edit input{max-width:none}}

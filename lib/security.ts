@@ -6,14 +6,14 @@ export type SafeUser={id:string;username:string;display_name:string;role:string;
 export const SESSION_COOKIE_NAME='onmaeum_session';
 
 const ADMIN_ACTIONS=[
-  'createParticipant','updateParticipant','createProgram','createRun','updateProgram','updateRunStatus','updateSession','createScheduleEvent',
+  'createParticipant','updateParticipant','createProgram','copyProgram','createRun','copyRun','updateRun','deleteRun','removeFromRun','updateProgram','updateRunStatus','updateSession','updateSessionsBulk','createScheduleEvent',
   'apply','assignRun','applyToRun','applicationStatus','attendance','attendanceBulk','closeAttendanceSession','reopenAttendanceSession',
   'mergeParticipants','createUser','updateUser','changeMyPin','recordAccess','addAssessmentType','setAssessmentActive',
   'setProgramAssessments','saveAssessmentScore','saveSatisfaction','participantPhoneSearch','settings','backup','checkBackup','restoreBackup','certificate','import','logout',
 ] as const;
 
 const GENERAL_ACTIONS=[
-  'createParticipant','updateParticipant','createProgram','createRun','updateProgram','updateRunStatus','updateSession','createScheduleEvent',
+  'createParticipant','updateParticipant','createProgram','copyProgram','createRun','copyRun','updateRun','deleteRun','removeFromRun','updateProgram','updateRunStatus','updateSession','updateSessionsBulk','createScheduleEvent',
   'apply','assignRun','applyToRun','applicationStatus','attendance','attendanceBulk','closeAttendanceSession','changeMyPin','recordAccess',
   'addAssessmentType','setAssessmentActive','setProgramAssessments','saveAssessmentScore','saveSatisfaction','participantPhoneSearch','certificate','import','logout',
 ] as const;
