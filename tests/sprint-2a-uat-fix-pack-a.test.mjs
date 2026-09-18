@@ -60,16 +60,16 @@ test('Sprint 2A: application status is canonical in DB and snapshot; import retu
         {name:'Excel 신규 B',phone:'010-1000-0002',programName:'Sprint 2A 프로그램',appliedAt:'2026-09-18'},
         {name:'Excel 제외',phone:'010-1000-0003',programName:'없는 프로그램',appliedAt:'2026-09-19'},
       ]},cookie),importBody=await importResponse.json();
-      assert.equal(importResponse.status,200);assert.deepEqual(importBody.importResult,{processedCount:3,acceptedCount:2,participantCreatedCount:2,applicationCreatedCount:2,applicationUpdatedCount:0,rejectedCount:1,rejectedRows:[{rowNumber:4,reason:'프로그램명을 찾을 수 없습니다.'}]});
+      assert.equal(importResponse.status,200);assert.deepEqual(importBody.importResult,{totalRows:3,acceptedRows:2,createdParticipants:2,existingParticipants:0,createdApplications:2,updatedApplications:0,rejectedRows:1,rejected:[{rowNumber:4,code:'program_not_found',message:'프로그램을 확인할 수 없습니다.'}]});
       assert.equal(db.prepare("SELECT COUNT(*) AS count FROM participants WHERE name LIKE 'Excel 신규 %'").get().count,2);
       assert.equal(db.prepare("SELECT COUNT(*) AS count FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name LIKE 'Excel 신규 %' AND a.program_id='PRG-S2A'").get().count,2);
       assert.equal(importBody.applications.filter(item=>item.participant_name.startsWith('Excel 신규 ')).length,2);
       const optionalDate=await post({action:'import',rows:[{name:'Excel 기본 신청일',phone:'010-1000-0004',programName:'Sprint 2A 프로그램'}]},cookie),optionalDateBody=await optionalDate.json();
-      assert.equal(optionalDate.status,200);assert.equal(optionalDateBody.importResult.acceptedCount,1);assert.equal(db.prepare("SELECT applied_at FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name='Excel 기본 신청일'").get().applied_at,importToday);
+      assert.equal(optionalDate.status,200);assert.equal(optionalDateBody.importResult.acceptedRows,1);assert.equal(db.prepare("SELECT applied_at FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name='Excel 기본 신청일'").get().applied_at,importToday);
       const contextProgram=await post({action:'import',programId:'PRG-S2A',rows:[{name:'Excel 프로그램 생략',phone:'010-1000-0005'}]},cookie),contextProgramBody=await contextProgram.json();
-      assert.equal(contextProgram.status,200);assert.equal(contextProgramBody.importResult.acceptedCount,1);assert.equal(db.prepare("SELECT a.program_id FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name='Excel 프로그램 생략'").get().program_id,'PRG-S2A');
+      assert.equal(contextProgram.status,200);assert.equal(contextProgramBody.importResult.acceptedRows,1);assert.equal(db.prepare("SELECT a.program_id FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name='Excel 프로그램 생략'").get().program_id,'PRG-S2A');
       const noProgram=await post({action:'import',rows:[{name:'Excel 프로그램 누락',phone:'010-1000-0006'}]},cookie),noProgramBody=await noProgram.json();
-      assert.equal(noProgram.status,200);assert.equal(noProgramBody.importResult.rejectedCount,1);assert.deepEqual(noProgramBody.importResult.rejectedRows,[{rowNumber:2,reason:'프로그램명 또는 선택한 프로그램이 필요합니다.'}]);assert.equal(db.prepare("SELECT COUNT(*) AS count FROM participants WHERE name='Excel 프로그램 누락'").get().count,0);
+      assert.equal(noProgram.status,200);assert.equal(noProgramBody.importResult.rejectedRows,1);assert.deepEqual(noProgramBody.importResult.rejected,[{rowNumber:2,code:'program_required',message:'프로그램명 또는 선택한 프로그램이 필요합니다.'}]);assert.equal(db.prepare("SELECT COUNT(*) AS count FROM participants WHERE name='Excel 프로그램 누락'").get().count,0);
       const importAuditBefore=db.prepare("SELECT COUNT(*) AS count FROM audit_logs WHERE action='import_complete'").get().count;
       db.exec("CREATE TRIGGER fail_s2a_import BEFORE INSERT ON participants WHEN NEW.name='Excel rollback B' BEGIN SELECT RAISE(ABORT,'injected import failure'); END");
       const failed=await post({action:'import',rows:[{name:'Excel rollback A',phone:'010-1000-0011',programName:'Sprint 2A 프로그램'},{name:'Excel rollback B',phone:'010-1000-0012',programName:'Sprint 2A 프로그램'}]},cookie);

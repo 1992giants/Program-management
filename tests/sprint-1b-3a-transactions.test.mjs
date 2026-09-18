@@ -72,7 +72,7 @@ test('transaction hardening rolls back partial business writes and audit failure
       {name:'가져오기 정상 2',phone:'010-2000-0003',programName:'TX Program A'},
     ]},cookie);
     assert.equal(response.status,200);assert.equal(count('participants',"name LIKE '가져오기 정상 %'"),2);assert.equal(count('participants','name=?','가져오기 거부'),0);assert.equal(auditCount('import_complete'),importAudit+1);
-    const importMetadata=JSON.parse(db.prepare("SELECT after_json FROM audit_logs WHERE action='import_complete' ORDER BY id DESC LIMIT 1").get().after_json);assert.equal(importMetadata.processed_count,3);assert.equal(importMetadata.participant_created_count,2);assert.equal(importMetadata.application_created_count,2);assert.equal(importMetadata.rejected_count,1);
+    const importMetadata=JSON.parse(db.prepare("SELECT after_json FROM audit_logs WHERE action='import_complete' ORDER BY id DESC LIMIT 1").get().after_json);assert.equal(importMetadata.total_rows,3);assert.equal(importMetadata.created_participants,2);assert.equal(importMetadata.created_applications,2);assert.equal(importMetadata.rejected_rows,1);
 
     db.exec("CREATE TRIGGER fail_import_third BEFORE INSERT ON participants WHEN NEW.name='가져오기 DB 실패 3' BEGIN SELECT RAISE(ABORT,'test import failure'); END");
     response=await post({action:'import',rows:[

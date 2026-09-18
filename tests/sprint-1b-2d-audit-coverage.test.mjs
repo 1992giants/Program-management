@@ -53,20 +53,20 @@ test('core lifecycle and import mutations record canonical minimized audits',()=
     assert.equal(programUpdateAudit.entity_id,updatedProgram.id);assert.equal(updatedProgram.location,'PHONE_SECRET');assert.equal(db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE run_id IN (SELECT id FROM program_runs WHERE program_id=?) AND location=?').get(program.id,'PHONE_SECRET').count,4);
     assert.deepEqual(programUpdateAfter.changed_fields,['name','category','location','manager','capacity','status']);assert.equal(programUpdateAfter.status_before,'운영 중');assert.equal(programUpdateAfter.status_after,'일시 중단');assert.equal(programUpdateAfter.session_location_updated,true);assert.equal(programUpdateAfter.affected_session_count,4);
 
-    db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run('P-IMPORT-EXISTING','기존 참가자','미입력',0,'PHONE_SECRET','회원','NOTE_SECRET',today);
+    db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run('P-IMPORT-EXISTING','기존 참가자','미입력',0,'010-9010-0001','회원','NOTE_SECRET',today);
     db.prepare("INSERT INTO applications (participant_id,program_id,run_id,applied_at,status,queue_number,status_reason) VALUES (?,?,NULL,?,'취소',1,?)").run('P-IMPORT-EXISTING',program.id,today,'STATUS_REASON_SECRET');
     const importAuditCount=auditRows('import_complete').length;
     const invalidImport=await post({action:'import',rows:'EXCEL_ROW_SECRET'},cookie);assert.equal(invalidImport.status,400);assert.equal(auditRows('import_complete').length,importAuditCount);
     const importResponse=await post({action:'import',rows:[
-      {name:'EXCEL_ROW_SECRET 신규',gender:'미입력',age:0,phone:'PHONE_SECRET 신규',memberStatus:'비회원',programName:'SESSION_SECRET',appliedAt:today,note:'NOTE_SECRET'},
-      {name:'기존 참가자',gender:'미입력',age:0,phone:'PHONE_SECRET',memberStatus:'회원',programName:'SESSION_SECRET',appliedAt:today,statusReason:'STATUS_REASON_SECRET'},
-      {name:'',phone:'SCHEDULE_TITLE_SECRET',programName:'SESSION_SECRET'},
-      {name:'NOTE_SECRET 미배정',phone:'SCHEDULE_TITLE_SECRET',programName:'존재하지 않는 프로그램'},
+      {name:'EXCEL_ROW_SECRET 신규',gender:'미입력',age:0,phone:'010-9010-0002',memberStatus:'비회원',programName:'SESSION_SECRET',appliedAt:today,note:'NOTE_SECRET'},
+      {name:'기존 참가자',gender:'미입력',age:0,phone:'010-9010-0001',memberStatus:'회원',programName:'SESSION_SECRET',appliedAt:today,statusReason:'STATUS_REASON_SECRET'},
+      {name:'',phone:'010-9010-0003',programName:'SESSION_SECRET'},
+      {name:'NOTE_SECRET 미배정',phone:'010-9010-0003',programName:'존재하지 않는 프로그램'},
     ]},cookie);
     assert.equal(importResponse.status,200);assert.equal(auditRows('import_complete').length,importAuditCount+1);
     const importAudit=lastAudit('import_complete'),importAfter=JSON.parse(importAudit.after_json);
     assert.equal(importAudit.entity_type,'가져오기');assert.match(importAudit.entity_id,/^IMPORT-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-    assert.deepEqual(importAfter,{processed_count:4,participant_created_count:1,participant_updated_count:0,application_created_count:1,application_updated_count:1,duplicate_count:1,rejected_count:2});
+    assert.deepEqual(importAfter,{total_rows:4,accepted_rows:2,rejected_rows:2,created_participants:1,existing_participants:1,created_applications:1,updated_applications:1});
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM participants WHERE name=?').get('NOTE_SECRET 미배정').count,0);
     assert.equal(db.prepare('SELECT status FROM applications WHERE participant_id=? AND program_id=?').get('P-IMPORT-EXISTING',program.id).status,'신청');
 

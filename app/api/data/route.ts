@@ -252,7 +252,7 @@ async function handlePOST(request:Request) {
     if(user.must_change_pin&&!['changeMyPin','logout'].includes(action))return Response.json({error:'관리자가 발급한 임시 PIN을 먼저 변경하세요.'},{status:403});if(!canPerformAction(user,action))return Response.json({error:`${user.role} 권한으로는 이 작업을 수행할 수 없습니다.`},{status:403});
     let responseWarning='';
     let updatedApplicationReason:{applicationId:number;reasonPresent:boolean;statusReason:string}|undefined;
-    let importResult:{processedCount:number;acceptedCount:number;participantCreatedCount:number;applicationCreatedCount:number;applicationUpdatedCount:number;rejectedCount:number;rejectedRows:{rowNumber:number;reason:string}[]}|undefined;
+    let importResult:{totalRows:number;acceptedRows:number;createdParticipants:number;existingParticipants:number;createdApplications:number;updatedApplications:number;rejectedRows:number;rejected:{rowNumber:number;code:string;message:string}[]}|undefined;
     let invalidateCurrentSession=false;
     if(body.action==='logout'){
       withImmediateTransaction(db,()=>{invalidateAuthSession(request,db);logChange(db,'로그아웃','사용자',user.id,null,null,'로그아웃',user.id,'',requestIp(request))});
@@ -500,27 +500,48 @@ async function handlePOST(request:Request) {
       withImmediateTransaction(db,()=>{const result=db.prepare('INSERT INTO certificates (participant_id,issued_at,session_count) VALUES (?,?,?)').run(participant.id,today,sessionCount),certificateId=Number(result.lastInsertRowid);const certificate=db.prepare('SELECT id,participant_id,session_count FROM certificates WHERE id=?').get(certificateId) as {id:number;participant_id:string;session_count:number};logChange(db,'certificate_create','확인서',certificate.id,null,{participant_id:certificate.participant_id,session_count:certificate.session_count,issued:true},'참여확인서 발급 이력 생성',user.id,'',requestIp(request))});
     } else if (body.action === 'import') {
       if(!Array.isArray(body.rows))throw new ActionError('가져올 행 목록을 올바르게 전송하세요.');
-      const input = body.rows as Record<string,unknown>[],operationId=`IMPORT-${randomUUID()}`,contextProgramId=text(body.programId).trim();
-      const contextProgram=contextProgramId?(db.prepare('SELECT id FROM programs WHERE id=?').get(contextProgramId) as {id:string}|undefined):undefined;
+      const input=body.rows as Record<string,unknown>[];
+      if(input.length>1000)throw new ActionError('한 번에 최대 1,000행까지 가져올 수 있습니다.');
+      const operationId=`IMPORT-${randomUUID()}`,contextProgramId=text(body.programId).trim();
+      const contextProgram=contextProgramId?(db.prepare('SELECT id,name FROM programs WHERE id=?').get(contextProgramId) as {id:string;name:string}|undefined):undefined;
       if(contextProgramId&&!contextProgram)throw new ActionError('선택한 프로그램을 찾을 수 없습니다.');
-      let processedCount=0,participantCreatedCount=0,applicationCreatedCount=0,applicationUpdatedCount=0,duplicateCount=0,rejectedCount=0;
-      const participantUpdatedCount=0,rejectedRows:{rowNumber:number;reason:string}[]=[];
+      let acceptedRows=0,createdParticipants=0,existingParticipants=0,createdApplications=0,updatedApplications=0;
+      const rejected:{rowNumber:number;code:string;message:string}[]=[];
+      const reject=(rowNumber:number,code:string,message:string)=>rejected.push({rowNumber,code,message});
       withImmediateTransaction(db,()=>{
-        for (const [index,item] of input.slice(0,1000).entries()) {
-          processedCount+=1;
-          const rowNumber=index+2,name=String(item.name||'').trim(); if(!name){rejectedCount+=1;rejectedRows.push({rowNumber,reason:'이름이 없습니다.'});continue;}
-          const program=contextProgram||db.prepare('SELECT id FROM programs WHERE name=?').get(text(item.programName)) as {id:string}|undefined;
-          if(!program){rejectedCount+=1;rejectedRows.push({rowNumber,reason:text(item.programName).trim()?'프로그램명을 찾을 수 없습니다.':'프로그램명 또는 선택한 프로그램이 필요합니다.'});continue;}
-          let participant=db.prepare('SELECT id FROM participants WHERE name=? AND phone=?').get(name,text(item.phone)) as {id:string}|undefined;
-          if(!participant){const id=`P-${today.slice(0,4)}-${String(Date.now()+Math.random()).replace(/\D/g,'').slice(-6)}`;db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run(id,name,text(item.gender)||'미입력',Number(item.age||0),text(item.phone),text(item.memberStatus)||'비회원','Excel 가져오기',today);participant={id};participantCreatedCount+=1;}else duplicateCount+=1;
-          const existingApplication=db.prepare('SELECT id FROM applications WHERE participant_id=? AND program_id=?').get(participant.id,program.id) as {id:number}|undefined,now=new Date().toISOString();
-          db.prepare(`INSERT INTO applications (participant_id,program_id,run_id,applied_at,status,queue_number,status_updated_at) VALUES (?,?,NULL,?,'신청',?,?) ON CONFLICT(participant_id,program_id) DO UPDATE SET status='신청',status_reason='',status_updated_at=excluded.status_updated_at`).run(participant.id,program.id,text(item.appliedAt)||today,nextQueueNumber(db,program.id),now);
-          if(existingApplication)applicationUpdatedCount+=1;else applicationCreatedCount+=1;
+        for(const [index,item] of input.entries()){
+          const rowNumber=index+2,name=text(item.name).trim(),rawPhone=text(item.phone).trim(),normalizedPhone=rawPhone.replace(/\D/g,''),rawAge=text(item.age).trim(),rowProgramName=text(item.programName).trim(),runLabel=text(item.runLabel).trim(),appliedAt=text(item.appliedAt).trim(),memberStatus=text(item.memberStatus).trim()||'비회원';
+          if(!name){reject(rowNumber,'name_required','이름이 없습니다.');continue;}
+          if(!/^[0-9]{10,11}$/.test(normalizedPhone)){reject(rowNumber,'phone_invalid','연락처 형식이 올바르지 않습니다.');continue;}
+          const age=rawAge===''?0:Number(rawAge);
+          if(!Number.isInteger(age)||age<0||age>120){reject(rowNumber,'age_invalid','나이는 0~120 정수여야 합니다.');continue;}
+          if(!['회원','비회원','휴면'].includes(memberStatus)){reject(rowNumber,'member_status_invalid','허용되지 않은 회원여부 값입니다.');continue;}
+          if(appliedAt&&!isCanonicalCalendarDate(appliedAt)){reject(rowNumber,'application_date_invalid','신청날짜 형식이 올바르지 않습니다.');continue;}
+          if(contextProgram&&rowProgramName&&rowProgramName!==contextProgram.name){reject(rowNumber,'program_context_mismatch','선택한 프로그램과 Excel 프로그램명이 일치하지 않습니다.');continue;}
+          const program=contextProgram||(rowProgramName?db.prepare('SELECT id,name FROM programs WHERE name=?').get(rowProgramName) as {id:string;name:string}|undefined:undefined);
+          if(!program){reject(rowNumber,rowProgramName?'program_not_found':'program_required',rowProgramName?'프로그램을 확인할 수 없습니다.':'프로그램명 또는 선택한 프로그램이 필요합니다.');continue;}
+          let requestedRun:{id:string;program_id:string}|undefined;
+          if(runLabel){
+            const runs=db.prepare('SELECT id,program_id FROM program_runs WHERE label=?').all(runLabel) as {id:string;program_id:string}[];
+            if(!runs.length){reject(rowNumber,'run_not_found','차수를 확인할 수 없습니다.');continue;}
+            requestedRun=runs.find(run=>run.program_id===program.id);
+            if(!requestedRun){reject(rowNumber,'program_run_mismatch','프로그램과 차수가 일치하지 않습니다.');continue;}
+          }
+          let participant=db.prepare(`SELECT id FROM participants WHERE TRIM(name)=? AND REPLACE(REPLACE(TRIM(phone),'-',''),' ','')=?`).get(name,normalizedPhone) as {id:string}|undefined;
+          let participantCreated=false;
+          if(!participant){const id=`P-${randomUUID()}`;db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run(id,name,text(item.gender).trim()||'미입력',age,rawPhone,memberStatus,'Excel 가져오기',today);participant={id};participantCreated=true;}
+          const existingApplication=db.prepare('SELECT id,run_id FROM applications WHERE participant_id=? AND program_id=?').get(participant.id,program.id) as {id:number;run_id:string|null}|undefined;
+          const resolvedRunId=requestedRun?.id??(existingApplication?.run_id??null);
+          if(existingApplication&&existingApplication.run_id!==resolvedRunId&&applicationHasHistoricalData(db,existingApplication.id)){reject(rowNumber,'historical_run_reassignment','기존 운영 이력이 있는 신청은 다른 차수로 재배정할 수 없습니다.');continue;}
+          const now=new Date().toISOString();
+          db.prepare(`INSERT INTO applications (participant_id,program_id,run_id,applied_at,status,queue_number,status_updated_at) VALUES (?,?,?,?, '신청',?,?) ON CONFLICT(participant_id,program_id) DO UPDATE SET run_id=excluded.run_id,status='신청',status_reason='',status_updated_at=excluded.status_updated_at`).run(participant.id,program.id,resolvedRunId,appliedAt||today,nextQueueNumber(db,program.id),now);
+          acceptedRows+=1;
+          if(participantCreated)createdParticipants+=1;else existingParticipants+=1;
+          if(existingApplication)updatedApplications+=1;else createdApplications+=1;
         }
-        logChange(db,'import_complete','가져오기',operationId,null,{processed_count:processedCount,participant_created_count:participantCreatedCount,participant_updated_count:participantUpdatedCount,application_created_count:applicationCreatedCount,application_updated_count:applicationUpdatedCount,duplicate_count:duplicateCount,rejected_count:rejectedCount},'Excel 참가자 및 신청 가져오기 완료',user.id,'',requestIp(request));
+        logChange(db,'import_complete','가져오기',operationId,null,{total_rows:input.length,accepted_rows:acceptedRows,rejected_rows:rejected.length,created_participants:createdParticipants,existing_participants:existingParticipants,created_applications:createdApplications,updated_applications:updatedApplications},'Excel 참가자 및 신청 가져오기 완료',user.id,'',requestIp(request));
       });
-      importResult={processedCount,acceptedCount:processedCount-rejectedCount,participantCreatedCount,applicationCreatedCount,applicationUpdatedCount,rejectedCount,rejectedRows};
-    } else return Response.json({error:'지원하지 않는 작업입니다.'},{status:400});
+      importResult={totalRows:input.length,acceptedRows,createdParticipants,existingParticipants,createdApplications,updatedApplications,rejectedRows:rejected.length,rejected};    } else return Response.json({error:'지원하지 않는 작업입니다.'},{status:400});
     if(invalidateCurrentSession)return clearSessionCookie(Response.json({ok:true,loginRequired:true}));
     return Response.json({...snapshot(user),...(responseWarning?{warning:responseWarning}:{}),...(updatedApplicationReason?{updatedApplicationReason}:{}),...(importResult?{importResult}:{})});
   } catch(error) { return error instanceof ActionError?Response.json({error:error.message},{status:400}):internalError(error); }
