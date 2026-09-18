@@ -33,7 +33,7 @@ test('Sprint 2A: application status is canonical in DB and snapshot; import retu
       import assert from 'node:assert/strict';
       import { POST } from './app/api/data/route.ts';
       import { getDatabase,hashPin } from './db/index.ts';
-      const db=getDatabase(),today='2026-09-17',origin='http://localhost:3000';
+      const db=getDatabase(),today='2026-09-17',importToday=new Date().toLocaleDateString('sv-SE',{timeZone:'Asia/Seoul'}),origin='http://localhost:3000';
       db.prepare('INSERT INTO staff_users (id,username,display_name,pin_hash,role,active,created_at,must_change_pin) VALUES (?,?,?,?,?,1,?,0)').run('USR-S2A','s2a-admin','Sprint 관리자',hashPin('s2a-admin','86420975'),'관리자',today);
       db.prepare('INSERT INTO programs (id,name,category,delivery_type,session_count,recurrence,location,manager,capacity,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run('PRG-S2A','Sprint 2A 프로그램','회복','집단',1,'매주','센터','담당자',20,'운영 중',today);
       db.prepare('INSERT INTO participants (id,name,gender,age,phone,member_status,note,created_at) VALUES (?,?,?,?,?,?,?,?)').run('P-S2A','상태 전환 대상','미입력',0,'010-0000-0000','비회원','',today);
@@ -65,7 +65,7 @@ test('Sprint 2A: application status is canonical in DB and snapshot; import retu
       assert.equal(db.prepare("SELECT COUNT(*) AS count FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name LIKE 'Excel 신규 %' AND a.program_id='PRG-S2A'").get().count,2);
       assert.equal(importBody.applications.filter(item=>item.participant_name.startsWith('Excel 신규 ')).length,2);
       const optionalDate=await post({action:'import',rows:[{name:'Excel 기본 신청일',phone:'010-1000-0004',programName:'Sprint 2A 프로그램'}]},cookie),optionalDateBody=await optionalDate.json();
-      assert.equal(optionalDate.status,200);assert.equal(optionalDateBody.importResult.acceptedCount,1);assert.equal(db.prepare("SELECT applied_at FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name='Excel 기본 신청일'").get().applied_at,today);
+      assert.equal(optionalDate.status,200);assert.equal(optionalDateBody.importResult.acceptedCount,1);assert.equal(db.prepare("SELECT applied_at FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name='Excel 기본 신청일'").get().applied_at,importToday);
       const contextProgram=await post({action:'import',programId:'PRG-S2A',rows:[{name:'Excel 프로그램 생략',phone:'010-1000-0005'}]},cookie),contextProgramBody=await contextProgram.json();
       assert.equal(contextProgram.status,200);assert.equal(contextProgramBody.importResult.acceptedCount,1);assert.equal(db.prepare("SELECT a.program_id FROM applications a JOIN participants p ON p.id=a.participant_id WHERE p.name='Excel 프로그램 생략'").get().program_id,'PRG-S2A');
       const noProgram=await post({action:'import',rows:[{name:'Excel 프로그램 누락',phone:'010-1000-0006'}]},cookie),noProgramBody=await noProgram.json();

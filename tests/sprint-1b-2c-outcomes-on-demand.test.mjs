@@ -72,15 +72,15 @@ test('staff 성과 원자료는 선택한 프로그램 또는 차수 범위에�
 
     const programResponse=await get('/api/data?resource=outcomes&programId=PRG-OUT-A',staff.cookie);assert.equal(programResponse.status,200);assert.equal(programResponse.headers.get('cache-control'),'no-store');
     const programBody=await programResponse.json();assert.equal(programBody.programId,'PRG-OUT-A');assert.equal(programBody.runId,null);
-    assert.deepEqual(programBody.assessmentScores.map(row=>row.application_id),[601,602,603]);assert.deepEqual(programBody.satisfactionSurveys.map(row=>row.application_id),[601,602,603]);
+    assert.deepEqual(programBody.assessmentScores.map(row=>row.application_id),[601,602,603,607]);assert.deepEqual(programBody.satisfactionSurveys.map(row=>row.application_id),[601,602,603,607]);
     assert.deepEqual(Object.keys(programBody.assessmentScores[0]).sort(),['application_id','assessment_id','not_completed_reason','note','post_date','post_score','pre_date','pre_score']);
     assert.deepEqual(Object.keys(programBody.satisfactionSurveys[0]).sort(),['anonymous','application_id','comment','score','survey_version']);
-    const programSerialized=JSON.stringify(programBody);assert.equal(programSerialized.includes('OUTCOME-B1-NOTE'),false);assert.equal(programSerialized.includes('OUTCOME-INCONSISTENT-NOTE'),false);assert.equal(programSerialized.includes('OUTCOME-CANCELLED-NOTE'),false);assert.equal(programSerialized.includes('OUTCOME-WITHDRAWN-NOTE'),false);assert.ok(programSerialized.includes('OUTCOME-A0-NOTE'));
+    const programSerialized=JSON.stringify(programBody);assert.equal(programSerialized.includes('OUTCOME-B1-NOTE'),false);assert.equal(programSerialized.includes('OUTCOME-INCONSISTENT-NOTE'),false);assert.equal(programSerialized.includes('OUTCOME-CANCELLED-NOTE'),false);assert.ok(programSerialized.includes('OUTCOME-WITHDRAWN-NOTE'));assert.ok(programSerialized.includes('OUTCOME-A0-NOTE'));
 
     const runResponse=await get('/api/data?resource=outcomes&programId=PRG-OUT-A&runId=RUN-OUT-A1',staff.cookie);assert.equal(runResponse.status,200);
-    const runBody=await runResponse.json();assert.equal(runBody.programId,'PRG-OUT-A');assert.equal(runBody.runId,'RUN-OUT-A1');assert.deepEqual(runBody.assessmentScores.map(row=>row.application_id),[601]);assert.deepEqual(runBody.satisfactionSurveys.map(row=>row.application_id),[601]);
+    const runBody=await runResponse.json();assert.equal(runBody.programId,'PRG-OUT-A');assert.equal(runBody.runId,'RUN-OUT-A1');assert.deepEqual(runBody.assessmentScores.map(row=>row.application_id),[601,607]);assert.deepEqual(runBody.satisfactionSurveys.map(row=>row.application_id),[601,607]);
     const runBBody=await (await get('/api/data?resource=outcomes&programId=PRG-OUT-B&runId=RUN-OUT-B1',staff.cookie)).json();assert.deepEqual(runBBody.assessmentScores.map(row=>row.application_id),[604]);assert.deepEqual(runBBody.satisfactionSurveys.map(row=>row.application_id),[604]);
-    const expanded=await get('/api/data?resource=outcomes&programId=PRG-OUT-A&runId=RUN-OUT-A1&include=all',staff.cookie);assert.equal(expanded.status,200);assert.deepEqual((await expanded.json()).assessmentScores.map(row=>row.application_id),[601]);
+    const expanded=await get('/api/data?resource=outcomes&programId=PRG-OUT-A&runId=RUN-OUT-A1&include=all',staff.cookie);assert.equal(expanded.status,200);assert.deepEqual((await expanded.json()).assessmentScores.map(row=>row.application_id),[601,607]);
 
     const invalidUrls=[
       '/api/data?resource=outcomes',
@@ -126,7 +126,7 @@ test('staff 성과 원자료는 선택한 프로그램 또는 차수 범위에�
     const authoritative=await (await get('/api/data?resource=outcomes&programId=PRG-OUT-A&runId=RUN-OUT-A1',staff.cookie)).json();
     assert.deepEqual(authoritative.assessmentScores[0],{application_id:601,assessment_id:'ASM-PHQ9',pre_score:26.123456,post_score:6,pre_date:today,post_date:today,note:'OUTCOME-A1-NOTE',not_completed_reason:'OUTCOME-A1-REASON'});
     assert.deepEqual(authoritative.satisfactionSurveys[0],{application_id:601,score:4,comment:'SAT-A1-COMMENT',survey_version:'1.0',anonymous:0});
-    const programAuthoritative=await (await get('/api/data?resource=outcomes&programId=PRG-OUT-A',staff.cookie)).json();assert.deepEqual(programAuthoritative.assessmentScores.map(row=>row.application_id),[601,602,603]);assert.deepEqual(programAuthoritative.satisfactionSurveys.map(row=>row.application_id),[601,602,603]);
+    const programAuthoritative=await (await get('/api/data?resource=outcomes&programId=PRG-OUT-A',staff.cookie)).json();assert.deepEqual(programAuthoritative.assessmentScores.map(row=>row.application_id),[601,602,603,607]);assert.deepEqual(programAuthoritative.satisfactionSurveys.map(row=>row.application_id),[601,602,603,607]);
     const auditSerialized=JSON.stringify(db.prepare('SELECT * FROM audit_logs').all());
     for(const secret of ['OUTCOME-A1-NOTE','OUTCOME-A1-REASON','SAT-A1-COMMENT','INJECTED-SCORE','WRONG-RUN','UNCONFIGURED','WRONG-SCOPE','INCONSISTENT-SCORE-WRITE','INCONSISTENT-SAT-WRITE','CANCELLED-SCORE-WRITE','CANCELLED-SAT-WRITE','WITHDRAWN-SCORE-WRITE','WITHDRAWN-SAT-WRITE'])assert.equal(auditSerialized.includes(secret),false,secret);
     console.log(JSON.stringify({ok:true}));

@@ -78,10 +78,10 @@ test('staff 출석 민감정보는 선택한 회기에서만 조회되고 mutati
     const detailResponse=await get('/api/data?resource=attendance&sessionId=SESSION-ATT-A1',staff.cookie);
     assert.equal(detailResponse.status,200);assert.equal(detailResponse.headers.get('cache-control'),'no-store');
     const detail=await detailResponse.json();assert.equal(detail.sessionId,'SESSION-ATT-A1');assert.equal(detail.runId,'RUN-ATT-A');
-    assert.deepEqual(detail.attendance.map(row=>row.application_id),[701]);
+    assert.deepEqual(detail.attendance.map(row=>row.application_id),[701,704]);
     assert.deepEqual(Object.keys(detail.attendance[0]).sort(),['application_id','contacted_at','id','makeup_for_session_id','note','session_id','status']);
     assert.ok(JSON.stringify(detail).includes('ATTENDANCE_NOTE_A_SENTINEL'));
-    for(const secret of ['ATTENDANCE_NOTE_A2_SENTINEL','ATTENDANCE_NOTE_B_SENTINEL','ATTENDANCE_INCONSISTENT_SENTINEL','ATTENDANCE_CANCELLED_SENTINEL','ATTENDANCE_WITHDRAWN_SENTINEL','CROSS_PROGRAM_NOTE_SENTINEL'])assert.equal(JSON.stringify(detail).includes(secret),false);
+    assert.ok(JSON.stringify(detail).includes('ATTENDANCE_WITHDRAWN_SENTINEL'));for(const secret of ['ATTENDANCE_NOTE_A2_SENTINEL','ATTENDANCE_NOTE_B_SENTINEL','ATTENDANCE_INCONSISTENT_SENTINEL','ATTENDANCE_CANCELLED_SENTINEL','CROSS_PROGRAM_NOTE_SENTINEL'])assert.equal(JSON.stringify(detail).includes(secret),false);
     const expanded=await get('/api/data?resource=attendance&sessionId=SESSION-ATT-A1&includeAll=true&fields=*',staff.cookie);assert.equal(expanded.status,200);assert.deepEqual(Object.keys((await expanded.json()).attendance[0]).sort(),['application_id','contacted_at','id','makeup_for_session_id','note','session_id','status']);
     const closedRead=await get('/api/data?resource=attendance&sessionId=SESSION-ATT-A-CLOSED',staff.cookie);assert.equal(closedRead.status,200);assert.ok(JSON.stringify(await closedRead.json()).includes('ATTENDANCE_CLOSED_SENTINEL'));
 

@@ -60,3 +60,7 @@ select,input[type="checkbox"],input[type="radio"]{cursor:pointer}input[type="che
 
 /* Run deletion and rename */
 .run-label-edit{display:flex;align-items:center;gap:6px}.run-label-edit input{max-width:175px;padding:6px 8px;border:1px solid #d9e2de;border-radius:7px;font-size:12px;font-weight:700}.run-label-edit button,.danger-text{border:0;background:transparent;color:#bf6049;font-size:8px;font-weight:700}.run-actions .danger-button{min-height:32px;padding:7px 9px;font-size:9px;white-space:nowrap}.assigned-people>span .danger-text{display:block;margin-top:4px;padding:0}@media(max-width:720px){.run-label-edit{align-items:stretch;flex-direction:column}.run-label-edit input{max-width:none}}
+
+
+/* Historical outcomes are visible but immutable after withdrawal */
+.outcome-read-only fieldset{min-inline-size:0;margin:0;padding:0;border:0}.outcome-read-only{background:#f8faf9}
